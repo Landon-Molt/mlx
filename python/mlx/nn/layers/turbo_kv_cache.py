@@ -4838,13 +4838,15 @@ class TurboKVCacheLite:
     The compression is a side-effect that doesn't affect attention.
     """
 
-    def __init__(self, kv_cache, bits: int = 4, seed: int = 42):
+    def __init__(self, kv_cache, bits: int = 4, seed: int = 42, encode_batch: int = 32):
         self._kv = kv_cache
         self._bits = bits
         self._seed = seed
         self._compressed = False
         self._packed_values: Optional[mx.array] = None
         self._value_norms: Optional[mx.array] = None
+        self._encode_batch = encode_batch  # Batch-encode every N decode tokens
+        self._n_pending = 0  # Decode tokens not yet compressed
 
     def update_and_fetch(self, keys, values):
         result = self._kv.update_and_fetch(keys, values)
@@ -4857,6 +4859,24 @@ class TurboKVCacheLite:
                 v, bits=self._bits, seed=self._seed
             )
             self._compressed = True
+            self._n_pending = 1  # The token that triggered compression
+        elif self._compressed and keys.shape[2] == 1:
+            # Continuous compression: batch-encode new decode tokens every N steps
+            self._n_pending += 1
+            if self._n_pending >= self._encode_batch:
+                # Encode the pending decode tokens
+                start = self._kv.offset - self._n_pending
+                new_v = self._kv.values[..., start:self._kv.offset, :]
+                new_pv, new_vn = turbo_encode(
+                    new_v, bits=self._bits, seed=self._seed
+                )
+                self._packed_values = mx.concatenate(
+                    [self._packed_values, new_pv], axis=2
+                )
+                self._value_norms = mx.concatenate(
+                    [self._value_norms, new_vn], axis=2
+                )
+                self._n_pending = 0
 
         return result
 
