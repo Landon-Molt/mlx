@@ -4838,34 +4838,45 @@ class TurboKVCacheLite:
     The compression is a side-effect that doesn't affect attention.
     """
 
-    def __init__(self, kv_cache, bits: int = 4, seed: int = 42, encode_batch: int = 32):
+    def __init__(self, kv_cache, bits: int = 4, key_bits: int = 0,
+                 seed: int = 42, encode_batch: int = 32):
         self._kv = kv_cache
         self._bits = bits
+        self._key_bits = key_bits  # 0 = don't compress K, >0 = compress K too
         self._seed = seed
         self._compressed = False
+        self._packed_keys: Optional[mx.array] = None
+        self._key_norms: Optional[mx.array] = None
         self._packed_values: Optional[mx.array] = None
         self._value_norms: Optional[mx.array] = None
-        self._encode_batch = encode_batch  # Batch-encode every N decode tokens
-        self._n_pending = 0  # Decode tokens not yet compressed
+        self._encode_batch = encode_batch
+        self._n_pending = 0
 
     def update_and_fetch(self, keys, values):
         result = self._kv.update_and_fetch(keys, values)
 
         # Detect prefill→decode transition: first single-token after multi-token
         if not self._compressed and keys.shape[2] == 1 and self._kv.offset > 1:
-            # Compress V from the prefill (everything except the last token)
-            v = self._kv.values[..., : self._kv.offset - 1, :]
+            n_prefill = self._kv.offset - 1
+            # Compress V from the prefill
+            v = self._kv.values[..., :n_prefill, :]
             self._packed_values, self._value_norms = turbo_encode(
                 v, bits=self._bits, seed=self._seed
             )
+            # Compress K if requested
+            if self._key_bits > 0:
+                k = self._kv.keys[..., :n_prefill, :]
+                self._packed_keys, self._key_norms = turbo_encode(
+                    k, bits=self._key_bits, seed=self._seed
+                )
             self._compressed = True
-            self._n_pending = 1  # The token that triggered compression
+            self._n_pending = 1
         elif self._compressed and keys.shape[2] == 1:
             # Continuous compression: batch-encode new decode tokens every N steps
             self._n_pending += 1
             if self._n_pending >= self._encode_batch:
-                # Encode the pending decode tokens
                 start = self._kv.offset - self._n_pending
+                # Encode V
                 new_v = self._kv.values[..., start:self._kv.offset, :]
                 new_pv, new_vn = turbo_encode(
                     new_v, bits=self._bits, seed=self._seed
@@ -4876,6 +4887,18 @@ class TurboKVCacheLite:
                 self._value_norms = mx.concatenate(
                     [self._value_norms, new_vn], axis=2
                 )
+                # Encode K if requested
+                if self._key_bits > 0:
+                    new_k = self._kv.keys[..., start:self._kv.offset, :]
+                    new_pk, new_kn = turbo_encode(
+                        new_k, bits=self._key_bits, seed=self._seed
+                    )
+                    self._packed_keys = mx.concatenate(
+                        [self._packed_keys, new_pk], axis=2
+                    )
+                    self._key_norms = mx.concatenate(
+                        [self._key_norms, new_kn], axis=2
+                    )
                 self._n_pending = 0
 
         return result
@@ -4960,45 +4983,53 @@ class TurboKVCacheLite:
     # Memory stats
     @property
     def memory_savings(self) -> float:
-        """Fraction of V memory saved by compression (0.0 to 1.0)."""
-        if not self._compressed or self._packed_values is None:
+        """Fraction of KV memory saved by compression (0.0 to 1.0)."""
+        if not self._compressed:
             return 0.0
-        fp_bytes = self._kv.values[..., : self._kv.offset, :].nbytes
-        packed_bytes = self._packed_values.nbytes + self._value_norms.nbytes
+        fp_bytes = self.fp16_size_bytes
+        packed_bytes = self.compressed_size_bytes
         return 1.0 - packed_bytes / fp_bytes if fp_bytes > 0 else 0.0
 
     @property
     def compressed_size_bytes(self) -> int:
-        """Size of compressed V storage in bytes."""
-        if self._packed_values is None:
-            return 0
-        return self._packed_values.nbytes + self._value_norms.nbytes
+        """Size of compressed K+V storage in bytes."""
+        total = 0
+        if self._packed_values is not None:
+            total += self._packed_values.nbytes + self._value_norms.nbytes
+        if self._packed_keys is not None:
+            total += self._packed_keys.nbytes + self._key_norms.nbytes
+        return total
 
     @property
     def fp16_size_bytes(self) -> int:
-        """Size of FP16 V in bytes."""
-        if self._kv.values is None:
-            return 0
-        return self._kv.values[..., : self._kv.offset, :].nbytes
+        """Size of FP16 K+V in bytes."""
+        total = 0
+        if self._kv.values is not None:
+            total += self._kv.values[..., : self._kv.offset, :].nbytes
+        if self._kv.keys is not None:
+            total += self._kv.keys[..., : self._kv.offset, :].nbytes
+        return total
 
 
 def make_turbo_cache(
     model,
     bits: int = 4,
+    key_bits: int = 4,
     boundary: int = 2,
     seed: int = 42,
 ) -> list:
     """One-line TurboQuant KV cache setup for mlx-lm models.
 
     Uses standard KVCache for full-speed attention (zero decode overhead).
-    Compresses V after prefill for memory savings. At long context, the
-    compressed V can be used to recover memory by dropping FP16 V.
+    Compresses K/V after prefill for memory savings. At long context, the
+    compressed data can be used to recover memory by dropping FP16.
 
     Works with stock mlx-lm — no fork needed. Only requires TheTom/mlx.
 
     Args:
         model: The mlx-lm model (e.g., from ``mlx_lm.load()``).
         bits (int): V quantization bit-width (2, 3, or 4). Default: 4.
+        key_bits (int): K quantization bit-width. 0 = don't compress K. Default: 4.
         boundary (int): Number of first/last attention layers to keep at FP16
             (no compression). Default: 2.
         seed (int): SRHT random seed. Default: 42.
@@ -5031,7 +5062,7 @@ def make_turbo_cache(
         if rank < boundary or rank >= n_kv - boundary:
             continue
         base_cache[idx] = TurboKVCacheLite(
-            base_cache[idx], bits=bits, seed=seed
+            base_cache[idx], bits=bits, key_bits=key_bits, seed=seed
         )
 
     return base_cache
