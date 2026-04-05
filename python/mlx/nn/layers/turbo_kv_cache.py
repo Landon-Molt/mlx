@@ -2913,9 +2913,7 @@ class TurboKVCache:
         skip_decoded = (
             (self.compact_threshold > 0 and self.offset > self.compact_threshold)
             or (self._patched and self.compress_keys and self.compress_values and self.k_bits == self.v_bits == 4)
-            # Asymmetric patched: K=FP16, V=turbo4. Skip decoded V — the patched
-            # SDPA uses turbo_asymmetric_attention which reads packed V directly.
-            or (self._patched and not self.compress_keys and self.compress_values and self.v_bits == 4)
+            # Asymmetric patched: disabled — always seed decoded V for SDPA fallback safety
         )
         if skip_decoded and not self._patched:
             self._compact_mode = True
@@ -3086,16 +3084,7 @@ class TurboKVCache:
         # the SDPA uses turbo_asymmetric_attention which scores with raw FP16 K
         # and does weighted sum on packed V. We store raw K and encode+append V.
         # No V decode buffers allocated — eliminates the #1 gap.
-        _can_fuse_asymmetric = (
-            self._patched
-            and num_steps == 1
-            and not self.compress_keys       # K stays at FP16
-            and self.compress_values         # V is turbo-compressed
-            and self.v_bits == 4
-            and dim is not None
-            and dim <= 256
-            and mx.metal.is_available()
-        )
+        _can_fuse_asymmetric = False  # Disabled: always return real decoded V for SDPA fallback safety
         if _can_fuse_asymmetric:
             # Append raw FP16 keys (no encode needed)
             if self._fp_keys is not None:
