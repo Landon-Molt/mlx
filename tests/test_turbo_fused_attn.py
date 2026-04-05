@@ -29,6 +29,7 @@ from mlx.nn.layers.turbo_kv_cache import (
     turbo_fused_attention,
     _get_codebook,
     _sign_flip_vector,
+    _sign_flip_vector2,
 )
 
 
@@ -251,7 +252,8 @@ def test_wht_domain_math(verbose=False):
     bits = 4
     seed = 42
     cb = _get_codebook(bits, dim)
-    signs = _sign_flip_vector(dim, seed)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
 
     mx.random.seed(4)
     q = mx.random.normal((dim,)).astype(mx.float32)
@@ -265,7 +267,9 @@ def test_wht_domain_math(verbose=False):
     dot_standard = mx.sum(q * k_decoded).item()
 
     # Method 2: WHT-domain dot product
-    q_rot = mx.hadamard_transform((q * signs).reshape(1, dim)).reshape(dim)
+    # Full SRHT rotation: q_rot = signs2 * WHT(signs1 * q) / sqrt(n)
+    # Must apply BOTH sign flips to match the encode pipeline
+    q_rot = (mx.hadamard_transform((q * signs1).reshape(1, dim)) * signs2).reshape(dim)
 
     # Unpack indices and lookup centroids
     from mlx.nn.layers.turbo_kv_cache import _unpack_indices
