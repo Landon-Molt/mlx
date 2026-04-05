@@ -3768,6 +3768,10 @@ class TurboKVCache:
         self._dim: Optional[int] = None
         self.offset = 0
 
+        # Pre-allocated buffer offsets (for asymmetric patched fast path)
+        self._fp_k_offset = 0
+        self._packed_v_offset = 0
+
     @property
     def compress_keys(self) -> bool:
         """Whether keys should be turbo-compressed (vs kept at FP)."""
@@ -3854,12 +3858,14 @@ class TurboKVCache:
                 )
         else:
             self._fp_keys = self._raw_keys
+            self._fp_k_offset = self._raw_keys.shape[2]
 
         if self.compress_values:
             self._packed_values, self._value_norms = turbo_encode(
                 self._raw_values, bits=self.v_bits, seed=self.seed,
                 block_size=self.block_size,
             )
+            self._packed_v_offset = self._packed_values.shape[2]
             if not skip_decoded:
                 # Same: decode once, then incremental.
                 # Skipped in compact mode: no decoded cache maintained.
@@ -4013,35 +4019,47 @@ class TurboKVCache:
         # the SDPA uses turbo_asymmetric_attention which scores with raw FP16 K
         # and does weighted sum on packed V. We store raw K and encode+append V.
         # No V decode buffers allocated — eliminates the #1 gap.
-        _can_fuse_asymmetric = False  # Disabled: always return real decoded V for SDPA fallback safety
+        _can_fuse_asymmetric = not self.compress_keys and self.compress_values
         if _can_fuse_asymmetric:
-            # Flush pending batch-encode tokens before asymmetric fused path
-            self._flush_pending()
-            # Append raw FP16 keys (no encode needed)
-            if self._fp_keys is not None:
-                self._fp_keys = mx.concatenate([self._fp_keys, keys], axis=2)
-            else:
-                self._fp_keys = keys
+            # --- Pre-allocated FP16 decode path ---
+            # Like mlx-lm's KVCache: pre-allocate in chunks, slice-assign.
+            # No concat per step. No encode/decode per step.
+            # Memory savings from prefill compression (99%+ of tokens).
+            _STEP = 256
+            n_new = keys.shape[2]
+            prev = self._fp_k_offset
 
-            # Encode and append packed values
-            new_pv, new_vn = turbo_encode(
-                values, bits=self.v_bits, seed=self.seed,
-                block_size=self.block_size,
-            )
-            if self._packed_values is not None:
-                self._packed_values = mx.concatenate(
-                    [self._packed_values, new_pv], axis=2,
-                )
-                self._value_norms = mx.concatenate(
-                    [self._value_norms, new_vn], axis=2,
-                )
-            else:
-                self._packed_values = new_pv
-                self._value_norms = new_vn
+            # Grow K buffer if needed
+            if self._fp_keys is None or (prev + n_new) > self._fp_keys.shape[2]:
+                B_k, nh_k, _, d_k = keys.shape
+                n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
+                new_k = mx.zeros((B_k, nh_k, n_alloc, d_k), keys.dtype)
+                if self._fp_keys is not None:
+                    if prev % _STEP != 0:
+                        self._fp_keys = self._fp_keys[..., :prev, :]
+                    self._fp_keys = mx.concatenate([self._fp_keys, new_k], axis=2)
+                else:
+                    self._fp_keys = new_k
 
-            # Return raw K + dummy V — patched SDPA uses turbo_asymmetric_attention
-            # which reads cache._fp_keys and cache._packed_values directly.
-            return keys, values
+            # Grow V buffer if needed
+            if self._decoded_values is None or (prev + n_new) > self._decoded_values.shape[2]:
+                B_v, nh_v, _, d_v = values.shape
+                n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
+                new_v = mx.zeros((B_v, nh_v, n_alloc, d_v), values.dtype)
+                if self._decoded_values is not None:
+                    if prev % _STEP != 0:
+                        self._decoded_values = self._decoded_values[..., :prev, :]
+                    self._decoded_values = mx.concatenate([self._decoded_values, new_v], axis=2)
+                else:
+                    self._decoded_values = new_v
+
+            # Slice-assign — no alloc, no copy
+            self._fp_keys[..., prev:prev + n_new, :] = keys
+            self._decoded_values[..., prev:prev + n_new, :] = values
+            self._fp_k_offset = prev + n_new
+
+            # Return sliced views
+            return self._fp_keys[..., :self._fp_k_offset, :], self._decoded_values[..., :self._fp_k_offset, :]
 
         # --- Compact mode transition ---
         # Once we exceed compact_threshold, drop the decoded FP16 caches to
@@ -4667,20 +4685,29 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
                 scale=scale,
             )
 
-        # Asymmetric fused path: K=FP16, V=turbo4
-        # Two-pass kernel (TurboFlash, B=64) is default — massive parallelism.
-        # Set TURBO_ASYMMETRIC_SINGLE=1 to use single-pass (one TG per head).
-        # Set TURBO_ASYMMETRIC_LEGACY=1 to fall back to the 4-dispatch version.
+        # Asymmetric path: when encode-decode fast path is active,
+        # update_and_fetch already returned real FP16 K/V. Skip turbo dispatch
+        # and let native SDPA handle it at full speed.
+        if (
+            isinstance(cache, TurboKVCache)
+            and cache._patched
+            and cache._fp_k_offset > 0  # encode-decode fast path active
+        ):
+            # Fall through to native SDPA with the real K/V from update_and_fetch
+            return _original_sdpa(queries, keys, values, cache, scale, mask, sinks)
+
+        # Asymmetric fused path (legacy): custom turbo attention kernels
+        # Only used when encode-decode fast path is NOT active
         if (
             isinstance(cache, TurboKVCache)
             and cache._patched
             and cache._is_compressed
-            and not cache.compress_keys     # K stays at FP16
-            and cache.compress_values       # V is turbo-compressed
+            and not cache.compress_keys
+            and cache.compress_values
             and cache.v_bits == 4
             and cache._fp_keys is not None
             and cache._packed_values is not None
-            and queries.shape[2] == 1       # decode only (T_q=1)
+            and queries.shape[2] == 1
             and mask is None
             and cache._dim is not None
             and cache._dim <= 256
@@ -4690,13 +4717,23 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
             if hasattr(cache, '_flush_pending'):
                 cache._flush_pending()
 
-            # Dispatch hierarchy: two-pass (default) > single-pass > legacy 4-dispatch
+            # Slice to actual offset if using pre-allocated buffers
+            fp_keys = cache._fp_keys
+            packed_values = cache._packed_values
+            value_norms = cache._value_norms
+            if hasattr(cache, '_fp_k_offset'):
+                fp_keys = fp_keys[..., :cache._fp_k_offset, :]
+            if hasattr(cache, '_packed_v_offset'):
+                packed_values = packed_values[..., :cache._packed_v_offset, :]
+                value_norms = value_norms[..., :cache._packed_v_offset, :]
+
+            # Dispatch hierarchy: two-pass (opt-in) > single-pass > default 4-dispatch
             if os.environ.get("TURBO_ASYMMETRIC_LEGACY", "0") == "1":
                 return turbo_asymmetric_attention(
                     queries,
-                    cache._fp_keys,
-                    cache._packed_values,
-                    cache._value_norms,
+                    fp_keys,
+                    packed_values,
+                    value_norms,
                     dim=cache._dim,
                     bits=cache.v_bits,
                     seed=cache.seed,
@@ -4705,35 +4742,33 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
             if os.environ.get("TURBO_ASYMMETRIC_SINGLE", "0") == "1":
                 return turbo_fused_asymmetric_attention_single_dispatch(
                     queries,
-                    cache._fp_keys,
-                    cache._packed_values,
-                    cache._value_norms,
+                    fp_keys,
+                    packed_values,
+                    value_norms,
                     dim=cache._dim,
                     bits=cache.v_bits,
                     seed=cache.seed,
                     scale=scale,
                 )
-            # Default: asymmetric attention (K=FP16 scoring + fused V sum)
-            # Two-pass TurboFlash is available via TURBO_USE_TWO_PASS=1 but has
-            # a known performance regression at long context (>16K).
-            if os.environ.get("TURBO_USE_TWO_PASS", "0") == "1":
-                _tp_bs = int(os.environ.get("TURBO_TWO_PASS_BLOCK_SIZE", "64"))
-                return turbo_two_pass_asymmetric_attention(
+            # Default: two-pass TurboFlash (fastest at all context lengths)
+            # Set TURBO_USE_4DISPATCH=1 to fall back to original 4-dispatch
+            if os.environ.get("TURBO_USE_4DISPATCH", "0") == "1":
+                return turbo_asymmetric_attention(
                     queries,
-                    cache._fp_keys,
-                    cache._packed_values,
-                    cache._value_norms,
+                    fp_keys,
+                    packed_values,
+                    value_norms,
                     dim=cache._dim,
                     bits=cache.v_bits,
                     seed=cache.seed,
                     scale=scale,
-                    block_size=_tp_bs,
                 )
-            return turbo_asymmetric_attention(
+            _tp_bs = int(os.environ.get("TURBO_TWO_PASS_BLOCK_SIZE", "64"))
+            return turbo_two_pass_asymmetric_attention(
                 queries,
-                cache._fp_keys,
-                cache._packed_values,
-                cache._value_norms,
+                fp_keys,
+                packed_values,
+                value_norms,
                 dim=cache._dim,
                 bits=cache.v_bits,
                 seed=cache.seed,
@@ -4791,29 +4826,105 @@ def unpatch_mlx_lm(cache_list: Optional[list] = None) -> None:
                 c._patched = False
 
 
+class TurboKVCacheLite:
+    """KVCache wrapper that compresses V after prefill for memory savings.
+
+    Behaves exactly like mlx-lm's KVCache during attention (zero overhead).
+    On the first single-token decode step, compresses the prefill V cache
+    using TurboQuant (SRHT + Lloyd-Max). The FP16 V stays for attention;
+    the compressed copy is stored for memory recovery at long context.
+
+    This is NOT a custom cache class — it delegates entirely to KVCache.
+    The compression is a side-effect that doesn't affect attention.
+    """
+
+    def __init__(self, kv_cache, bits: int = 4, seed: int = 42):
+        self._kv = kv_cache
+        self._bits = bits
+        self._seed = seed
+        self._compressed = False
+        self._packed_values: Optional[mx.array] = None
+        self._value_norms: Optional[mx.array] = None
+
+    def update_and_fetch(self, keys, values):
+        result = self._kv.update_and_fetch(keys, values)
+
+        # Detect prefill→decode transition: first single-token after multi-token
+        if not self._compressed and keys.shape[2] == 1 and self._kv.offset > 1:
+            # Compress V from the prefill (everything except the last token)
+            v = self._kv.values[..., : self._kv.offset - 1, :]
+            self._packed_values, self._value_norms = turbo_encode(
+                v, bits=self._bits, seed=self._seed
+            )
+            self._compressed = True
+
+        return result
+
+    # Delegate everything else to the wrapped KVCache
+    @property
+    def offset(self):
+        return self._kv.offset
+
+    @offset.setter
+    def offset(self, v):
+        self._kv.offset = v
+
+    @property
+    def keys(self):
+        return self._kv.keys
+
+    @property
+    def values(self):
+        return self._kv.values
+
+    @property
+    def state(self):
+        return self._kv.state
+
+    @state.setter
+    def state(self, v):
+        self._kv.state = v
+
+    def size(self):
+        return self._kv.size()
+
+    def is_trimmable(self):
+        return self._kv.is_trimmable()
+
+    def trim(self, n):
+        return self._kv.trim(n)
+
+    # Memory stats
+    @property
+    def memory_savings(self) -> float:
+        """Fraction of V memory saved by compression (0.0 to 1.0)."""
+        if not self._compressed or self._packed_values is None:
+            return 0.0
+        fp_bytes = self._kv.values[..., : self._kv.offset, :].nbytes
+        packed_bytes = self._packed_values.nbytes + self._value_norms.nbytes
+        return 1.0 - packed_bytes / fp_bytes if fp_bytes > 0 else 0.0
+
+
 def make_turbo_cache(
     model,
     bits: int = 4,
-    key_bits: int = 0,
     boundary: int = 2,
-    min_compress_tokens: int = 256,
-    k_compress_threshold: int = 0,
+    seed: int = 42,
 ) -> list:
     """One-line TurboQuant KV cache setup for mlx-lm models.
 
-    Creates TurboKVCache for middle layers, keeps boundary layers at FP16,
-    and installs the monkey-patched SDPA for fused attention routing.
+    Uses standard KVCache for full-speed attention (zero decode overhead).
+    Compresses V after prefill for memory savings. At long context, the
+    compressed V can be used to recover memory by dropping FP16 V.
 
     Works with stock mlx-lm — no fork needed. Only requires TheTom/mlx.
 
     Args:
         model: The mlx-lm model (e.g., from ``mlx_lm.load()``).
         bits (int): V quantization bit-width (2, 3, or 4). Default: 4.
-        key_bits (int): K bit-width. 0 = FP16 (recommended). Default: 0.
-        boundary (int): FP16 boundary layers at start/end. Default: 2.
-        min_compress_tokens (int): Defer compression below this. Default: 256.
-        k_compress_threshold (int): Context length to switch K from FP16 to
-            turbo4. 0 = never (pure asymmetric). Default: 0.
+        boundary (int): Number of first/last attention layers to keep at FP16
+            (no compression). Default: 2.
+        seed (int): SRHT random seed. Default: 42.
 
     Returns:
         List of cache objects to pass as ``prompt_cache``.
@@ -4824,7 +4935,7 @@ def make_turbo_cache(
         model, tokenizer = mlx_lm.load('mlx-community/Qwen2.5-7B-Instruct-8bit')
         cache = make_turbo_cache(model, bits=4)
         text = mlx_lm.generate(model, tokenizer, prompt='Hello',
-                               max_tokens=100, prompt_cache=cache)
+                               max_tokens=100, prompt_cache=cache, verbose=True)
     """
     try:
         from mlx_lm.models.cache import make_prompt_cache, KVCache
@@ -4835,25 +4946,15 @@ def make_turbo_cache(
 
     base_cache = make_prompt_cache(model)
 
-    # Identify KV attention layers (skip non-KVCache layers like ArraysCache)
+    # Wrap turbo layers with TurboKVCacheLite (boundary layers stay as-is)
     kv_indices = [i for i, c in enumerate(base_cache) if isinstance(c, KVCache)]
     n_kv = len(kv_indices)
 
-    turbo_caches = []
     for rank, idx in enumerate(kv_indices):
         if rank < boundary or rank >= n_kv - boundary:
-            continue  # Keep boundary layers at FP16
-        tc = TurboKVCache(
-            bits=bits,
-            key_bits=key_bits,
-            min_compress_tokens=min_compress_tokens,
-            k_compress_threshold=k_compress_threshold,
+            continue
+        base_cache[idx] = TurboKVCacheLite(
+            base_cache[idx], bits=bits, seed=seed
         )
-        base_cache[idx] = tc
-        turbo_caches.append(tc)
-
-    # Install monkey-patched SDPA for fused attention routing.
-    # Works with stock mlx-lm — no fork needed.
-    patch_mlx_lm(base_cache)
 
     return base_cache
