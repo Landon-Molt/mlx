@@ -3683,10 +3683,23 @@ class TurboKVCache:
         block_size: int = 0,
         compact_threshold: int = 8192,
         encode_batch_size: int = 8,
+        k_compress_threshold: int = 0,
     ):
         self.v_bits = bits
         self.k_bits = key_bits if key_bits is not None else bits
         self.seed = seed
+        # Adaptive K compression: when > 0 and k_bits <= 0 (asymmetric mode),
+        # K stays FP16 until seq_len crosses this threshold, then all existing
+        # FP16 K are batch-compressed to turbo4 and new K tokens are compressed
+        # on arrival. This gives asymmetric quality at short context (where
+        # precision matters) and symmetric bandwidth at long context (where
+        # reading less data matters). Set via TURBO_K_COMPRESS_THRESHOLD env var.
+        env_kct = os.environ.get("TURBO_K_COMPRESS_THRESHOLD")
+        if env_kct is not None:
+            k_compress_threshold = int(env_kct)
+        self.k_compress_threshold = k_compress_threshold
+        # The target K bits after adaptive compression kicks in (default: match V bits)
+        self._adaptive_k_bits = bits  # turbo4 when V is turbo4
         # WHT block size: 0 = full head_dim, 32 = blocked WHT (4 blocks of 32
         # for dim=128). block_size=32 gives -0.02 PPL AND 21% faster encode.
         self.block_size = block_size
@@ -3759,6 +3772,41 @@ class TurboKVCache:
     def compress_keys(self) -> bool:
         """Whether keys should be turbo-compressed (vs kept at FP)."""
         return self.k_bits > 0
+
+    def _maybe_compress_keys_adaptive(self) -> None:
+        """Adaptively compress K from FP16 to turbo4 when context crosses threshold.
+
+        Called during decode when k_compress_threshold > 0 and K is currently FP16.
+        Batch-compresses all existing FP16 K, flips k_bits to enable compressed K
+        going forward, and switches the SDPA routing from asymmetric to symmetric.
+
+        TODO: Write a two-pass symmetric kernel so the post-switch path is as fast
+        as the two-pass asymmetric kernel. Currently falls back to the single-pass
+        turbo_fused_attention which is slower.
+        """
+        if (
+            self.k_compress_threshold <= 0
+            or self.k_bits > 0  # Already compressing K
+            or self._fp_keys is None
+            or self.offset < self.k_compress_threshold
+        ):
+            return
+
+        # Flush any pending V tokens before we switch modes
+        self._flush_pending()
+
+        # Batch-compress all existing FP16 K to turbo4
+        self._packed_keys, self._key_norms = turbo_encode(
+            self._fp_keys, bits=self._adaptive_k_bits, seed=self.seed,
+            block_size=self.block_size,
+        )
+
+        # Free FP16 K storage — this is where the memory savings come from
+        self._fp_keys = None
+        self._decoded_keys = None
+
+        # Flip the mode: from this point on, new K tokens get compressed
+        self.k_bits = self._adaptive_k_bits
 
     @property
     def compress_values(self) -> bool:
@@ -3896,6 +3944,11 @@ class TurboKVCache:
         # --- Decode phase: encode new token(s), append, return decoded ---
         self.offset += num_steps
         dim = self._dim
+
+        # --- Adaptive K compression: switch K from FP16 to turbo4 at threshold ---
+        # This gives asymmetric quality at short context and symmetric bandwidth
+        # at long context. The SDPA routing auto-detects the switch via compress_keys.
+        self._maybe_compress_keys_adaptive()
 
         # --- Patched fast path: encode-only, no decode ---
         # When patch_mlx_lm() is active, the SDPA function is monkey-patched
