@@ -1243,84 +1243,81 @@ inline uint unpack4(uint word, uint pos) {
 """
 
 _TURBO_WEIGHTED_V_SUM_SOURCE = """
-    // Grid: one threadgroup per (batch, head) pair
-    // Threadgroup: (TG_SIZE, 1, 1) — threads split T_kv work
+    // Thread-per-dim kernel with T_kv tiling across threadgroups
+    //
+    // Grid: (n_bh * n_tiles, dim, 1) — threadgroups tile both (bh, T_kv)
+    // Threadgroup: (1, dim_tg, 1) — one thread per dimension within a tile
+    //
+    // Each threadgroup processes a TILE_T chunk of tokens for one (batch, head).
+    // Cooperative wn load into shared memory, then per-dim accumulation.
+    // Partial results written to out_accum[tile_idx, bh_idx, dim] then summed
+    // in Python.
     //
     // Inputs:
     //   weights:      [n_bh, T_kv]              — post-softmax attention weights
     //   packed_v:     [n_bh, T_kv, packed_dim]   — packed 4-bit V indices
     //   v_norms:      [n_bh, T_kv]              — V L2 norms
     //   centroids:    [n_levels]                  — centroid lookup table
-    //   params:       [3]                         — {dim, T_kv, packed_dim}
+    //   params:       [4]                         — {dim, T_kv, packed_dim, n_tiles}
     //
     // Outputs:
-    //   out_accum:    [n_bh, dim]               — WHT-domain weighted sum
-    //   simd_scratch: [n_bh, n_simd_groups]     — scratch for simd reductions
+    //   out_accum:    [n_bh * n_tiles, dim]      — partial tile results
 
-    uint tid = thread_position_in_threadgroup.x;
-    uint tg_size = threads_per_threadgroup.x;
-    uint bh_idx = threadgroup_position_in_grid.x;
+    constexpr int TILE_T = 256;
 
-    int dim = params[0];
+    uint flat_idx = threadgroup_position_in_grid.x;
+    uint d = thread_position_in_grid.y;
+
+    int dim_val = params[0];
     int T_kv = params[1];
     int packed_dim = params[2];
+    int n_tiles = params[3];
+
+    uint bh_idx = flat_idx / n_tiles;
+    uint tile_idx = flat_idx % n_tiles;
+
+    // Token range for this tile
+    int t_start = tile_idx * TILE_T;
+    int t_end = min(t_start + TILE_T, T_kv);
+    int tile_len = t_end - t_start;
+    if (tile_len <= 0) {
+        out_accum[flat_idx * dim_val + d] = 0.0f;
+        return;
+    }
+
+    // Which uint32 word and bit offset for this dimension's 4-bit index
+    int word_idx = d / 8;
+    int bit_offset = (d % 8) * 4;
 
     // Base offsets for this (batch, head)
     int w_base = bh_idx * T_kv;
     int pv_base = bh_idx * T_kv * packed_dim;
 
-    uint simd_lane = thread_index_in_simdgroup;
-    uint simd_id = tid / threads_per_simdgroup;
-    uint n_simd = (tg_size + threads_per_simdgroup - 1) / threads_per_simdgroup;
-    int scratch_base = bh_idx * n_simd;
+    // Shared memory for weight*norm values in this tile
+    threadgroup float wn_shared[TILE_T];
 
-    // Local V accumulator in registers
-    float v_accum[256];
-    for (int d = 0; d < dim; d++) {
-        v_accum[d] = 0.0f;
-    }
-
-    // Each thread processes a strided subset of T_kv tokens
-    for (int t = tid; t < T_kv; t += tg_size) {
+    // Cooperative load: dim threads load tile_len wn values
+    for (int i = (int)d; i < tile_len; i += dim_val) {
+        int t = t_start + i;
         float w = weights[w_base + t];
+        wn_shared[i] = (w < 1e-6f) ? 0.0f : w * v_norms[w_base + t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Sparse V skip: don't bother with near-zero weights
-        if (w < 1e-6f) continue;
+    float acc = 0.0f;
 
-        float norm_v = v_norms[w_base + t];
-        float wn = w * norm_v;
+    // Process all tokens in this tile
+    for (int i = 0; i < tile_len; i++) {
+        float wn = wn_shared[i];
+        if (wn == 0.0f) continue;
 
-        int pv_offset = pv_base + t * packed_dim;
-        for (int pw = 0; pw < packed_dim; pw++) {
-            uint word = packed_v[pv_offset + pw];
-            int base_d = pw * 8;  // 8 x 4-bit indices per uint32
-
-            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
-                uint idx = (word >> (j * 4)) & 0xF;
-                float c = centroids[idx];
-                v_accum[base_d + j] += wn * c;
-            }
-        }
+        int t = t_start + i;
+        uint word = packed_v[pv_base + t * packed_dim + word_idx];
+        uint idx = (word >> bit_offset) & 0xF;
+        acc += wn * centroids[idx];
     }
 
-    // Reduce V accumulators across threads via simd_sum + cross-simd reduce
-    for (int d = 0; d < dim; d++) {
-        float val = simd_sum(v_accum[d]);
-
-        if (simd_lane == 0) {
-            simd_scratch[scratch_base + simd_id] = val;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-
-        if (tid == 0) {
-            float total = 0.0f;
-            for (uint s = 0; s < n_simd; s++) {
-                total += simd_scratch[scratch_base + s];
-            }
-            out_accum[bh_idx * dim + d] = total;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-    }
+    out_accum[flat_idx * dim_val + d] = acc;
 """
 
 # Cache for the compiled weighted V sum kernel
@@ -1344,7 +1341,7 @@ def _get_weighted_v_sum_kernel(bits: int, nr0: int = 1):
     kernel = mx.fast.metal_kernel(
         name=f"turbo_weighted_v_sum_{bits}bit",
         input_names=["weights", "packed_v", "v_norms", "centroids", "params"],
-        output_names=["out_accum", "simd_scratch"],
+        output_names=["out_accum"],
         header=header,
         source=source,
     )
@@ -1422,13 +1419,13 @@ def turbo_weighted_value_sum(
     pv_flat = packed_values.reshape(n_bh, T_kv, packed_dim)
     vn_flat = value_norms.squeeze(-1).reshape(n_bh, T_kv).astype(mx.float32)
 
-    # Params
-    params = mx.array([dim, T_kv, packed_dim], dtype=mx.uint32)
+    # Thread-per-dim kernel with T_kv tiling across threadgroups
+    # Each threadgroup processes TILE_T=256 tokens for one (bh, tile) pair
+    # Partials summed in Python after kernel returns
+    TILE_T = 256
+    n_tiles = (T_kv + TILE_T - 1) // TILE_T
 
-    # Kernel launch config
-    tg_size = min(64, max(32, T_kv))
-    tg_size = ((tg_size + 31) // 32) * 32
-    n_simd_groups = tg_size // 32
+    params = mx.array([dim, T_kv, packed_dim, n_tiles], dtype=mx.uint32)
 
     kernel = _get_weighted_v_sum_kernel(bits)
 
@@ -1441,17 +1438,20 @@ def turbo_weighted_value_sum(
             params,             # params
         ],
         output_shapes=[
-            (n_bh, dim),              # out_accum
-            (n_bh, n_simd_groups),    # simd_scratch
+            (n_bh * n_tiles, dim),    # out_accum — partials per tile
         ],
-        output_dtypes=[mx.float32, mx.float32],
-        grid=(n_bh * tg_size, 1, 1),
-        threadgroup=(tg_size, 1, 1),
+        output_dtypes=[mx.float32],
+        grid=(n_bh * n_tiles, dim, 1),
+        threadgroup=(1, min(dim, 256), 1),
         init_value=0.0,
         stream=mx.gpu,
     )
 
-    out_rot = outputs[0]  # (n_bh, dim) — in WHT domain
+    # Sum partial tile results: (n_bh * n_tiles, dim) -> (n_bh, dim)
+    if n_tiles > 1:
+        out_rot = outputs[0].reshape(n_bh, n_tiles, dim).sum(axis=1)
+    else:
+        out_rot = outputs[0]  # (n_bh, dim) — in WHT domain
 
     # Inverse transform: signs1 * WHT(signs2 * out_rot)
     signs1 = _sign_flip_vector(dim, seed)
