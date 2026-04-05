@@ -79,6 +79,15 @@ _LLOYD_MAX_CENTROIDS = {
 }
 
 
+def _next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    if n <= 0:
+        return 1
+    if n & (n - 1) == 0:
+        return n
+    return 1 << (n - 1).bit_length()
+
+
 class TurboQuantCodebook:
     """Pre-computed codebook for TurboQuant.
 
@@ -97,32 +106,36 @@ class TurboQuantCodebook:
     the random projection compounds across decode steps. 16 centroids (4-bit)
     without correction outperform 8 centroids (3-bit) with correction.
 
+    For non-power-of-2 dims (e.g. Qwen3-4B d=80), the codebook is built for
+    the padded_dim (next power of 2). The encode/decode functions handle
+    zero-padding input to padded_dim and stripping back to original dim.
+
     Args:
         bits (int): Quantization bit-width (2, 3, or 4).
-        dim (int): Head dimension (e.g. 64, 128, 256). Must be power of 2.
+        dim (int): Head dimension (e.g. 64, 80, 128, 256). Non-power-of-2
+            dims are supported via zero-padding to next power of 2.
 
     Example:
         >>> cb = TurboQuantCodebook(bits=4, dim=128)
         >>> cb.centroids.shape  # (16,)
-        >>> cb.boundaries.shape  # (15,)
+        >>> cb = TurboQuantCodebook(bits=4, dim=80)  # Qwen3-4B
+        >>> cb.padded_dim  # 128
     """
 
     def __init__(self, bits: int, dim: int):
         if bits not in _LLOYD_MAX_CENTROIDS:
             raise ValueError(f"Unsupported bits={bits}. Must be 2, 3, or 4.")
-        # TODO: Support non-power-of-2 dims via padding (Qwen3-4B has d=80)
-        if dim & (dim - 1) != 0:
-            raise ValueError(
-                f"dim={dim} must be a power of 2 for hadamard_transform. "
-                "Non-power-of-2 support (e.g. Qwen3-4B d=80) is planned."
-            )
 
         self.bits = bits
         self.dim = dim
+        self.padded_dim = _next_power_of_2(dim)
         self.n_levels = 1 << bits
 
+        # Centroids are computed for padded_dim since WHT operates on that size
+        effective_dim = self.padded_dim
+
         force_n01 = os.environ.get("TURBO_USE_N01_CENTROIDS", "0") == "1"
-        beta_key = (bits, dim)
+        beta_key = (bits, effective_dim)
 
         if not force_n01 and beta_key in _BETA_CENTROIDS:
             # Beta distribution centroids — already scaled for this dim
@@ -130,8 +143,8 @@ class TurboQuantCodebook:
             self.centroids = mx.array(raw, dtype=mx.float32)
             self._centroid_source = "beta"
         else:
-            # Fallback: N(0,1) Lloyd-Max scaled by 1/sqrt(dim)
-            scale = 1.0 / math.sqrt(dim)
+            # Fallback: N(0,1) Lloyd-Max scaled by 1/sqrt(effective_dim)
+            scale = 1.0 / math.sqrt(effective_dim)
             raw = _LLOYD_MAX_CENTROIDS[bits]
             self.centroids = mx.array([c * scale for c in raw], dtype=mx.float32)
             self._centroid_source = "n01"
@@ -335,26 +348,34 @@ def turbo_encode(
         >>> norms.shape   # (4, 8, 1)
     """
     dim = x.shape[-1]
-    bs = dim if (block_size == 0 or block_size >= dim) else block_size
+    padded_dim = _next_power_of_2(dim)
+
+    # Pad non-power-of-2 dims with zeros before WHT (e.g. Qwen3-4B d=80 → 128)
+    if padded_dim != dim:
+        pad_width = padded_dim - dim
+        padding = mx.zeros((*x.shape[:-1], pad_width), dtype=x.dtype)
+        x = mx.concatenate([x, padding], axis=-1)
+
+    # block_size operates on the padded dim
+    bs = padded_dim if (block_size == 0 or block_size >= padded_dim) else block_size
 
     # Try fused Metal kernel first (fastest path — single Metal dispatch)
     # Toggle: set TURBO_DISABLE_FUSED_KERNEL=1 to force mx.compile path
-    # Fused kernel supports block_size via params
+    # Fused kernel supports block_size via params[3]
     use_fused = (
         bits == 4
-        and dim <= 256
-        and (dim & (dim - 1)) == 0
+        and padded_dim <= 256
         and (bs & (bs - 1)) == 0
-        and bs == dim  # fused kernel only supports full-dim WHT
+        and bs == padded_dim  # fused kernel only supports full-dim WHT
         and os.environ.get("TURBO_DISABLE_FUSED_KERNEL", "0") != "1"
     )
     if use_fused:
-        return turbo_encode_fused(x, bits=bits, seed=seed)
+        return turbo_encode_fused(x, bits=bits, seed=seed, block_size=block_size)
 
     # Fallback: mx.compile path
-    cache_key = (bits, dim, seed, bs)
+    cache_key = (bits, padded_dim, seed, bs)
     if cache_key not in _compiled_encode_cache:
-        _compiled_encode_cache[cache_key] = _make_compiled_encode(bits, dim, seed, block_size=block_size)
+        _compiled_encode_cache[cache_key] = _make_compiled_encode(bits, padded_dim, seed, block_size=block_size)
 
     return _compiled_encode_cache[cache_key](x)
 
@@ -453,30 +474,34 @@ def turbo_decode(
         >>> x_hat = turbo_decode(packed, norms, dim=128, bits=4, seed=42)
         >>> x_hat.shape  # same as original x
     """
-    bs = dim if (block_size == 0 or block_size >= dim) else block_size
+    padded_dim = _next_power_of_2(dim)
+    bs = padded_dim if (block_size == 0 or block_size >= padded_dim) else block_size
 
     # Try fused Metal kernel first (fastest path — single Metal dispatch)
-    # Fused kernel only supports full-dim WHT (same constraint as encode)
+    # Fused kernel only supports full-dim WHT on power-of-2 dims
     use_fused = (
         bits == 4
-        and dim <= 256
-        and (dim & (dim - 1)) == 0
+        and padded_dim <= 256
         and (bs & (bs - 1)) == 0
-        and bs == dim  # fused kernel only supports full-dim WHT
+        and bs == padded_dim  # fused kernel only supports full-dim WHT
         and os.environ.get("TURBO_DISABLE_FUSED_KERNEL", "0") != "1"
     )
     if use_fused:
-        return turbo_decode_fused(packed_indices, norms, dim, bits=bits, seed=seed, block_size=block_size)
+        result = turbo_decode_fused(packed_indices, norms, padded_dim, bits=bits, seed=seed, block_size=block_size)
+        # Strip padding if needed
+        if padded_dim != dim:
+            result = result[..., :dim]
+        return result
 
     # Fallback: Python graph path
     cb = _get_codebook(bits, bs)
 
-    # 1. Unpack indices
-    indices = _unpack_indices(packed_indices, bits, dim)
+    # 1. Unpack indices — packed storage uses padded_dim
+    indices = _unpack_indices(packed_indices, bits, padded_dim)
 
     # 2. Codebook lookup
     centroids = cb.centroids  # (n_levels,)
-    x_rotated = centroids[indices]  # (..., dim)
+    x_rotated = centroids[indices]  # (..., padded_dim)
 
     # 3. Inverse dual sign flip + WHT
     # Encode was: x_rot = signs2 * WHT(signs1 * x)
@@ -484,12 +509,11 @@ def turbo_decode(
     signs1 = _sign_flip_vector(bs, seed)
     signs2 = _sign_flip_vector2(bs, seed)
 
-    if bs < dim:
+    if bs < padded_dim:
         # Blocked inverse WHT: reshape → signs → WHT → signs → reshape back
-        # Must reshape BEFORE multiplying signs (which are block_size-length)
-        n_blocks = dim // bs
+        n_blocks = padded_dim // bs
         x_blocked = x_rotated.reshape(*x_rotated.shape[:-1], n_blocks, bs)
-        x_flipped = x_blocked * signs2  # signs2 broadcasts on last dim (bs,)
+        x_flipped = x_blocked * signs2
         x_wht = mx.hadamard_transform(x_flipped)
         x_unit = (x_wht * signs1).reshape(*x_rotated.shape)
     else:
@@ -499,6 +523,10 @@ def turbo_decode(
 
     # 4. Scale by norms
     x_reconstructed = x_unit * norms
+
+    # 5. Strip padding if needed (non-power-of-2 original dim)
+    if padded_dim != dim:
+        x_reconstructed = x_reconstructed[..., :dim]
 
     return x_reconstructed
 
@@ -553,6 +581,7 @@ _TURBO_ENCODE_SOURCE_4BIT = """
     uint dim = params[0];
     uint num_vectors = params[1];
     uint packed_dim = params[2];
+    uint wht_block_size = params[3];  // block_size for WHT (32 or dim)
 
     if (vec_idx >= num_vectors || tid >= dim) return;
 
@@ -589,25 +618,30 @@ _TURBO_ENCODE_SOURCE_4BIT = """
     // 3. Normalize to unit sphere
     val = val / norm;
 
-    // 4. Pre-WHT sign flip (signs1)
-    val = val * signs1[tid];
+    // 4. Pre-WHT sign flip (signs1) — signs are block_size-length, tiled via modulo
+    uint sign_idx = tid % wht_block_size;
+    val = val * signs1[sign_idx];
 
     // 5. WHT butterfly (in-place via shared memory, double-buffered reads)
-    //    Hadamard with 1/sqrt(dim) normalization (orthonormal)
-    //    log2(dim) stages of butterfly operations
+    //    Hadamard with 1/sqrt(block_size) normalization (orthonormal)
+    //    log2(block_size) stages of butterfly operations within each block
     //    Each stage: read pair into registers, barrier, write result
     shared_data[tid] = val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint log2_dim = 0;
-    for (uint d = dim; d > 1; d >>= 1) log2_dim++;
+    uint log2_bs = 0;
+    for (uint d = wht_block_size; d > 1; d >>= 1) log2_bs++;
 
-    for (uint stage = 0; stage < log2_dim; stage++) {
+    // WHT butterfly within each block of wht_block_size
+    uint block_start = (tid / wht_block_size) * wht_block_size;
+
+    for (uint stage = 0; stage < log2_bs; stage++) {
         uint half_block = 1u << stage;
-        uint block_size = half_block << 1;
-        uint block_idx = tid / block_size;
-        uint local_idx = tid % block_size;
-        uint base = block_idx * block_size;
+        uint bfly_size = half_block << 1;
+        uint local_tid = tid - block_start;  // position within WHT block
+        uint bfly_idx = local_tid / bfly_size;
+        uint local_idx = local_tid % bfly_size;
+        uint base = block_start + bfly_idx * bfly_size;
 
         // Read both operands into registers BEFORE any thread writes
         float a = shared_data[base + (local_idx % half_block)];
@@ -619,9 +653,9 @@ _TURBO_ENCODE_SOURCE_4BIT = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Apply 1/sqrt(dim) normalization + post-WHT sign flip (signs2)
-    float inv_sqrt_dim = rsqrt((float)dim);
-    float rotated = shared_data[tid] * inv_sqrt_dim * signs2[tid];
+    // Apply 1/sqrt(block_size) normalization + post-WHT sign flip (signs2)
+    float inv_sqrt_bs = rsqrt((float)wht_block_size);
+    float rotated = shared_data[tid] * inv_sqrt_bs * signs2[sign_idx];
 
     // 6. Boundary quantize — 4-bit has 15 boundaries
     uint idx = boundary_quantize(rotated, boundaries, 15);
@@ -690,6 +724,7 @@ _TURBO_DECODE_SOURCE_4BIT = """
     uint dim = params[0];
     uint num_vectors = params[1];
     uint packed_dim = params[2];
+    uint wht_block_size = params[3];  // block_size for WHT (32 or dim)
 
     if (vec_idx >= num_vectors || tid >= dim) return;
 
@@ -703,22 +738,26 @@ _TURBO_DECODE_SOURCE_4BIT = """
     uint idx = (packed_word >> (pos_in_word * 4)) & 0xF;
 
     // 2. Codebook lookup + pre-inverse-WHT sign flip (signs2)
-    float val = centroids[idx] * signs2[tid];
+    //    Signs are block_size-length, tiled via modulo
+    uint sign_idx = tid % wht_block_size;
+    float val = centroids[idx] * signs2[sign_idx];
 
-    // 3. Inverse WHT butterfly (Hadamard is self-inverse up to scaling)
-    //    Double-buffered: read pair → barrier → write result → barrier
+    // 3. Inverse WHT butterfly within each block (Hadamard is self-inverse up to scaling)
     shared_data[tid] = val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint log2_dim = 0;
-    for (uint d = dim; d > 1; d >>= 1) log2_dim++;
+    uint log2_bs = 0;
+    for (uint d = wht_block_size; d > 1; d >>= 1) log2_bs++;
 
-    for (uint stage = 0; stage < log2_dim; stage++) {
+    uint block_start = (tid / wht_block_size) * wht_block_size;
+
+    for (uint stage = 0; stage < log2_bs; stage++) {
         uint half_block = 1u << stage;
-        uint block_size = half_block << 1;
-        uint block_idx = tid / block_size;
-        uint local_idx = tid % block_size;
-        uint base = block_idx * block_size;
+        uint bfly_size = half_block << 1;
+        uint local_tid = tid - block_start;
+        uint bfly_idx = local_tid / bfly_size;
+        uint local_idx = local_tid % bfly_size;
+        uint base = block_start + bfly_idx * bfly_size;
 
         float a = shared_data[base + (local_idx % half_block)];
         float b = shared_data[base + (local_idx % half_block) + half_block];
@@ -728,11 +767,11 @@ _TURBO_DECODE_SOURCE_4BIT = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float inv_sqrt_dim = rsqrt((float)dim);
-    float rotated = shared_data[tid] * inv_sqrt_dim;
+    float inv_sqrt_bs = rsqrt((float)wht_block_size);
+    float rotated = shared_data[tid] * inv_sqrt_bs;
 
     // 4. Inverse sign flip — signs1 (post-inverse-WHT, undoes the pre-WHT flip)
-    rotated = rotated * signs1[tid];
+    rotated = rotated * signs1[sign_idx];
 
     // 5. Scale by norm
     float norm = norms_in[vec_idx];
