@@ -401,28 +401,29 @@ def turbo_encode_uncompiled(
         Same as turbo_encode: (packed_indices, norms).
     """
     dim = x.shape[-1]
-    bs = dim if (block_size == 0 or block_size >= dim) else block_size
+    padded_dim = _next_power_of_2(dim)
+
+    # Pad non-power-of-2 dims with zeros
+    if padded_dim != dim:
+        pad_width = padded_dim - dim
+        padding = mx.zeros((*x.shape[:-1], pad_width), dtype=x.dtype)
+        x = mx.concatenate([x, padding], axis=-1)
+
+    bs = padded_dim if (block_size == 0 or block_size >= padded_dim) else block_size
     cb = _get_codebook(bits, bs)
 
     # 1. Extract norms and normalize to unit sphere
-    # NOTE: No norm correction needed — WHT (hadamard_transform) is orthogonal,
-    # so norms are exactly preserved through the transform. Storing raw norms
-    # is sufficient. This saves a codebook lookup + norm computation + division
-    # per encoded vector vs. the corrected-norm approach.
     norms = mx.linalg.norm(x, axis=-1, keepdims=True)
-    # Avoid division by zero
     safe_norms = mx.maximum(norms, mx.array(1e-10))
     x_unit = x / safe_norms
 
-    # 2. Apply dual sign flip + WHT: x_rot = signs2 * WHT(signs1 * x) / sqrt(n)
-    # llama.cpp SRHT uses TWO sign arrays for better decorrelation.
-    # signs1 (pre-WHT) randomizes input, signs2 (post-WHT) breaks remaining structure.
+    # 2. Apply dual sign flip + WHT
     signs1 = _sign_flip_vector(bs, seed)
     signs2 = _sign_flip_vector2(bs, seed)
 
-    if bs < dim:
+    if bs < padded_dim:
         # Blocked WHT: reshape → signs → WHT per block → signs → reshape back
-        n_blocks = dim // bs
+        n_blocks = padded_dim // bs
         x_blocked = x_unit.reshape(*x_unit.shape[:-1], n_blocks, bs)
         x_wht = mx.hadamard_transform(x_blocked * signs1) * signs2
         x_rotated = x_wht.reshape(*x_unit.shape)
