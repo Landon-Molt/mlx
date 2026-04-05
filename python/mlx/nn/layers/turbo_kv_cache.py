@@ -2879,6 +2879,7 @@ class TurboKVCache:
         self._decoded_values: Optional[mx.array] = None
 
         self._is_compressed = False
+        self._is_turbo_kv = True  # Flag for mlx-lm SDPA detection
         self._dim: Optional[int] = None
         self.offset = 0
 
