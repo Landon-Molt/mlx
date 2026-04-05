@@ -15,6 +15,7 @@
 - Fused encode: norm → sign → WHT → quantize → pack (single dispatch)
 - Fused decode: unpack → centroid → WHT → sign → scale (single dispatch)
 - Fused attention: Q×packed_K scoring + softmax + packed_V sum (single dispatch)
+- **Two-pass TurboFlash (B=64)**: pass 1 = T/64 parallel threadgroups for block scoring + partial V sum, pass 2 = merge with online softmax correction + inverse WHT. Inspired by Eric Kryski's architecture.
 - NR0=2 multi-row: share KV dequant across 2 query rows
 - Tiled weighted V sum: thread-per-dim + T_kv tiling (TILE_T=256)
 
@@ -51,7 +52,7 @@
 
 ### Best Result
 7B dense (Qwen2.5-7B-Instruct-8bit, M5 Max):
-- Decode: 93% baseline (60.0 vs 64.5 tok/s)
+- Decode: **100% baseline** (63.7 vs 63.7 tok/s) — two-pass TurboFlash kernel
 - PPL: +0.04%
 - KLD: 0.000305, Top-1: 100%
 - NIAH: 30/30 PASS
