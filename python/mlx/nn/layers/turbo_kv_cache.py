@@ -2480,6 +2480,10 @@ class TurboKVCache:
             compression kicks in. Below this threshold, KV stays in raw FP16
             — the memory savings are <2MB but the encode/decode overhead
             costs ~30% decode speed. Default: 256.
+        compact_threshold (int): When offset exceeds this, drop the decoded
+            FP16 caches and re-decode from packed storage each step. Trades
+            O(n) decode cost per step (small vs O(n²) SDPA) for ~50% less
+            KV memory at long context. 0 = never compact. Default: 8192.
 
     Example:
         >>> import mlx_lm
@@ -2501,6 +2505,7 @@ class TurboKVCache:
         min_compress_tokens: int = 256,
         fused_attention: bool = False,
         block_size: int = 0,
+        compact_threshold: int = 8192,
     ):
         self.v_bits = bits
         self.k_bits = key_bits if key_bits is not None else bits
@@ -2512,6 +2517,13 @@ class TurboKVCache:
         # The memory savings at short context are <2MB but the speed cost of
         # encode/decode is ~30%. Only compress when the cache exceeds this size.
         self.min_compress_tokens = min_compress_tokens
+        # Compact mode: when offset exceeds this threshold, drop the decoded
+        # FP16 caches (_decoded_keys/_decoded_values) and re-decode the full
+        # packed cache each step. This trades O(n) decode per step for ~50%
+        # less KV memory. At long context the O(n²) SDPA dominates anyway.
+        # Set to 0 to disable (always keep decoded FP16 cache).
+        self.compact_threshold = compact_threshold
+        self._compact_mode = False  # Flipped once when threshold crossed
 
         # When True, skip creating decoded FP16 buffers during compression.
         # Use cache.attention() instead of update_and_fetch + SDPA to avoid
@@ -2567,21 +2579,30 @@ class TurboKVCache:
 
         self._dim = self._raw_keys.shape[-1]
 
+        # Check if we should go straight into compact mode (e.g., prefill
+        # was longer than compact_threshold — no point seeding decoded FP16
+        # just to immediately drop it).
+        skip_decoded = (
+            self.compact_threshold > 0
+            and self.offset > self.compact_threshold
+        )
+        if skip_decoded:
+            self._compact_mode = True
+
         if self.compress_keys:
             self._packed_keys, self._key_norms = turbo_encode(
                 self._raw_keys, bits=self.k_bits, seed=self.seed,
                 block_size=self.block_size,
             )
-            # Decode once to seed the FP16 cache — subsequent steps only
-            # decode the new token and concatenate (O(1) not O(n)).
-            # Always seed decoded cache so update_and_fetch works with
-            # standard SDPA. The fused kernel (attention() method) reads
-            # packed data directly and ignores decoded buffers.
-            self._decoded_keys = turbo_decode(
-                self._packed_keys, self._key_norms, self._dim,
-                bits=self.k_bits, seed=self.seed,
-                block_size=self.block_size,
-            )
+            if not skip_decoded:
+                # Decode once to seed the FP16 cache — subsequent steps only
+                # decode the new token and concatenate (O(1) not O(n)).
+                # Skipped in compact mode: no decoded cache maintained.
+                self._decoded_keys = turbo_decode(
+                    self._packed_keys, self._key_norms, self._dim,
+                    bits=self.k_bits, seed=self.seed,
+                    block_size=self.block_size,
+                )
         else:
             self._fp_keys = self._raw_keys
 
@@ -2590,13 +2611,14 @@ class TurboKVCache:
                 self._raw_values, bits=self.v_bits, seed=self.seed,
                 block_size=self.block_size,
             )
-            # Same: decode once, then incremental.
-            # Always seed decoded cache for update_and_fetch compatibility.
-            self._decoded_values = turbo_decode(
-                self._packed_values, self._value_norms, self._dim,
-                bits=self.v_bits, seed=self.seed,
-                block_size=self.block_size,
-            )
+            if not skip_decoded:
+                # Same: decode once, then incremental.
+                # Skipped in compact mode: no decoded cache maintained.
+                self._decoded_values = turbo_decode(
+                    self._packed_values, self._value_norms, self._dim,
+                    bits=self.v_bits, seed=self.seed,
+                    block_size=self.block_size,
+                )
         else:
             self._fp_values = self._raw_values
 
@@ -2674,6 +2696,20 @@ class TurboKVCache:
         self.offset += num_steps
         dim = self._dim
 
+        # --- Compact mode transition ---
+        # Once we exceed compact_threshold, drop the decoded FP16 caches to
+        # cut KV memory ~50%. From here on, we re-decode the full packed
+        # cache each step (O(n) per step, but O(n²) SDPA dominates at long
+        # context so the overhead is negligible).
+        if (
+            not self._compact_mode
+            and self.compact_threshold > 0
+            and self.offset > self.compact_threshold
+        ):
+            self._compact_mode = True
+            self._decoded_keys = None
+            self._decoded_values = None
+
         # Handle keys
         if self.compress_keys:
             new_pk, new_kn = turbo_encode(
@@ -2690,19 +2726,29 @@ class TurboKVCache:
             else:
                 self._packed_keys = new_pk
                 self._key_norms = new_kn
-            # Incremental decode: only decode the new token(s), concat with
-            # cached FP16. Avoids O(n) full-cache decode every step.
-            new_decoded_k = turbo_decode(
-                new_pk, new_kn, dim, bits=self.k_bits, seed=self.seed,
-                block_size=self.block_size,
-            )
-            if self._decoded_keys is not None:
-                self._decoded_keys = mx.concatenate(
-                    [self._decoded_keys, new_decoded_k], axis=2,
+
+            if self._compact_mode:
+                # Compact mode: full decode from packed each step.
+                # No FP16 cache maintained — saves ~50% KV memory.
+                all_keys = turbo_decode(
+                    self._packed_keys, self._key_norms, dim,
+                    bits=self.k_bits, seed=self.seed,
+                    block_size=self.block_size,
                 )
             else:
-                self._decoded_keys = new_decoded_k
-            all_keys = self._decoded_keys
+                # Incremental decode: only decode the new token(s), concat with
+                # cached FP16. Avoids O(n) full-cache decode every step.
+                new_decoded_k = turbo_decode(
+                    new_pk, new_kn, dim, bits=self.k_bits, seed=self.seed,
+                    block_size=self.block_size,
+                )
+                if self._decoded_keys is not None:
+                    self._decoded_keys = mx.concatenate(
+                        [self._decoded_keys, new_decoded_k], axis=2,
+                    )
+                else:
+                    self._decoded_keys = new_decoded_k
+                all_keys = self._decoded_keys
         else:
             if self._fp_keys is not None:
                 self._fp_keys = mx.concatenate([self._fp_keys, keys], axis=2)
@@ -2726,18 +2772,27 @@ class TurboKVCache:
             else:
                 self._packed_values = new_pv
                 self._value_norms = new_vn
-            # Incremental decode: only decode the new token(s)
-            new_decoded_v = turbo_decode(
-                new_pv, new_vn, dim, bits=self.v_bits, seed=self.seed,
-                block_size=self.block_size,
-            )
-            if self._decoded_values is not None:
-                self._decoded_values = mx.concatenate(
-                    [self._decoded_values, new_decoded_v], axis=2,
+
+            if self._compact_mode:
+                # Compact mode: full decode from packed each step.
+                all_values = turbo_decode(
+                    self._packed_values, self._value_norms, dim,
+                    bits=self.v_bits, seed=self.seed,
+                    block_size=self.block_size,
                 )
             else:
-                self._decoded_values = new_decoded_v
-            all_values = self._decoded_values
+                # Incremental decode: only decode the new token(s)
+                new_decoded_v = turbo_decode(
+                    new_pv, new_vn, dim, bits=self.v_bits, seed=self.seed,
+                    block_size=self.block_size,
+                )
+                if self._decoded_values is not None:
+                    self._decoded_values = mx.concatenate(
+                        [self._decoded_values, new_decoded_v], axis=2,
+                    )
+                else:
+                    self._decoded_values = new_decoded_v
+                all_values = self._decoded_values
         else:
             if self._fp_values is not None:
                 self._fp_values = mx.concatenate([self._fp_values, values], axis=2)
@@ -2981,12 +3036,13 @@ class TurboKVCache:
         return total
 
     def __repr__(self):
-        mode = "compressed" if self._is_compressed else "raw"
+        mode = "compact" if self._compact_mode else ("compressed" if self._is_compressed else "raw")
         k_desc = f"k={self.k_bits}bit" if self.compress_keys else "k=fp"
         v_desc = f"v={self.v_bits}bit" if self.compress_values else "v=fp"
         bs_desc = f"block={self.block_size}" if self.block_size > 0 else "block=full"
+        compact_desc = f"compact@{self.compact_threshold}" if self.compact_threshold > 0 else "no-compact"
         return (
             f"TurboKVCache({k_desc}, {v_desc}, {bs_desc}, {mode}, "
             f"offset={self.offset}, dim={self._dim}, "
-            f"min_compress={self.min_compress_tokens})"
+            f"min_compress={self.min_compress_tokens}, {compact_desc})"
         )
