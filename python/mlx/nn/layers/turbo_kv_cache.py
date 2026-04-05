@@ -4894,6 +4894,49 @@ class TurboKVCacheLite:
     def trim(self, n):
         return self._kv.trim(n)
 
+    def recover_memory(self) -> int:
+        """Drop the FP16 V for the prefill portion and keep only compressed V.
+
+        The FP16 V for the prefill tokens is replaced with the compressed copy.
+        Subsequent decode tokens remain in FP16 (they're a small fraction).
+        The KVCache values buffer is rebuilt: compressed prefill (decoded on
+        the fly) + raw decode tokens.
+
+        Returns:
+            Number of bytes freed.
+        """
+        if not self._compressed or self._packed_values is None:
+            return 0
+
+        n_compressed = self._packed_values.shape[2]
+        dim = self._kv.values.shape[-1]
+        offset = self._kv.offset
+
+        # Decode compressed prefill V back to FP16
+        decoded_prefill = turbo_decode(
+            self._packed_values, self._value_norms, dim,
+            bits=self._bits, seed=self._seed,
+        )
+
+        # Rebuild values buffer: decoded prefill + raw decode tokens
+        if offset > n_compressed:
+            raw_decode = self._kv.values[..., n_compressed:offset, :]
+            new_values = mx.concatenate([decoded_prefill, raw_decode], axis=2)
+        else:
+            new_values = decoded_prefill
+
+        old_nbytes = self._kv.values.nbytes
+        # Reset KVCache with rebuilt values (preserves keys untouched)
+        self._kv.values = mx.zeros_like(self._kv.values)
+        self._kv.values[..., :offset, :] = new_values[..., :offset, :]
+
+        # Drop the packed storage — it served its purpose
+        self._packed_values = None
+        self._value_norms = None
+        self._compressed = False
+
+        return old_nbytes - self._kv.values.nbytes
+
     # Memory stats
     @property
     def memory_savings(self) -> float:
@@ -4903,6 +4946,20 @@ class TurboKVCacheLite:
         fp_bytes = self._kv.values[..., : self._kv.offset, :].nbytes
         packed_bytes = self._packed_values.nbytes + self._value_norms.nbytes
         return 1.0 - packed_bytes / fp_bytes if fp_bytes > 0 else 0.0
+
+    @property
+    def compressed_size_bytes(self) -> int:
+        """Size of compressed V storage in bytes."""
+        if self._packed_values is None:
+            return 0
+        return self._packed_values.nbytes + self._value_norms.nbytes
+
+    @property
+    def fp16_size_bytes(self) -> int:
+        """Size of FP16 V in bytes."""
+        if self._kv.values is None:
+            return 0
+        return self._kv.values[..., : self._kv.offset, :].nbytes
 
 
 def make_turbo_cache(
