@@ -3776,6 +3776,7 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
             and cache._dim is not None
             and cache._dim <= 256
             and mx.metal.is_available()
+            and not getattr(cache, '_pending_raw_values', [])  # no unflushed batch tokens
         ):
             return turbo_asymmetric_attention(
                 queries,
