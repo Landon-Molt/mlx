@@ -1901,6 +1901,490 @@ def turbo_fused_asymmetric_attention_single_dispatch(
 
 
 # ---------------------------------------------------------------------------
+# Two-pass fused asymmetric attention (Eric Kryski's TurboFlash architecture)
+# ---------------------------------------------------------------------------
+#
+# Pass 1: Each threadgroup processes a block of B=64 KV tokens in parallel.
+#   - Computes Q·K scores for the block
+#   - Online softmax within the block (running max + exp sum)
+#   - Weighted V sum (centroid unpack from packed turbo4 V)
+#   - Stores per-block partial results: {partial_output[dim], block_max, block_sum}
+#
+# Pass 2: One threadgroup per query head merges all block partial results.
+#   - Online softmax merge across blocks (combine per-block max/sum → global)
+#   - Rescale partial outputs by correction factor
+#   - Sum into final output
+#   - Apply inverse WHT rotation (butterfly + sign flips)
+#
+# Why two-pass beats single-pass: the single-pass kernel assigns one threadgroup
+# per query head, serializing ALL T_kv tokens. With two-pass at B=64:
+#   Pass 1: T/64 threadgroups run in parallel (massive GPU occupancy)
+#   Pass 2: 1 threadgroup merges T/64 partial results (trivially fast)
+#
+# Eric benchmarked B=32, B=64, B=128 — B=64 is optimal for Apple Silicon.
+
+_TWO_PASS_BLOCK_SIZE = 64
+
+_TWO_PASS_ATTN_P1_SOURCE_4BIT = """
+    // Two-pass fused asymmetric attention — PASS 1 (block scoring + partial V)
+    //
+    // Grid: (n_bh, n_blocks, 1)
+    //   n_bh = B * n_q_heads
+    //   n_blocks = ceil(T_kv / BLOCK_SIZE)
+    //
+    // Threadgroup: (BLOCK_SIZE, 1, 1) where BLOCK_SIZE=64
+    //
+    // Each threadgroup processes one block of 64 KV tokens for one query head.
+    // Thread tid handles token t = block_id * BLOCK_SIZE + tid.
+    //
+    // Outputs per-block partial results:
+    //   partial_out[bh, block, dim]  — weighted V accumulator for this block
+    //   partial_max[bh, block]       — block max score (for softmax merge)
+    //   partial_sum[bh, block]       — block exp sum (for softmax merge)
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint bh_idx = threadgroup_position_in_grid.x;   // batch-head index
+    uint block_id = threadgroup_position_in_grid.y;  // which block of 64 tokens
+
+    int dim_val = params[0];
+    int T_kv = params[1];
+    int packed_dim = params[2];
+    float scale = as_type<float>(params[3]);
+    int gqa_factor = params[4];
+    int BLOCK_SIZE = params[5];
+    int n_blocks = params[6];
+
+    uint kv_head = bh_idx / gqa_factor;
+
+    int q_base  = bh_idx * dim_val;
+    int k_base  = kv_head * T_kv * dim_val;
+    int pv_base = kv_head * T_kv * packed_dim;
+    int vn_base = kv_head * T_kv;
+
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_id = tid / 32;
+
+    // Shared memory for query cache and SIMD reductions
+    threadgroup float shared_q[256];
+    threadgroup float shared_scratch[4];    // max 2 SIMD groups for B=64
+    threadgroup float shared_v_reduce[2 * 256];  // 2 SIMD groups * max dim
+
+    // Load query into shared memory (stride loop: BLOCK_SIZE threads load dim elements)
+    for (int d = (int)tid; d < dim_val; d += BLOCK_SIZE) {
+        shared_q[d] = queries[q_base + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Token index for this thread
+    int t = (int)(block_id * BLOCK_SIZE + tid);
+
+    // ====== Q·K score for this token ======
+    float score = -INFINITY;
+    if (t < T_kv) {
+        float dot = 0.0f;
+        int k_offset = k_base + t * dim_val;
+
+        // Unrolled 4x dot product
+        int d = 0;
+        for (; d + 3 < dim_val; d += 4) {
+            dot += shared_q[d]     * fp_keys[k_offset + d];
+            dot += shared_q[d + 1] * fp_keys[k_offset + d + 1];
+            dot += shared_q[d + 2] * fp_keys[k_offset + d + 2];
+            dot += shared_q[d + 3] * fp_keys[k_offset + d + 3];
+        }
+        for (; d < dim_val; d++) {
+            dot += shared_q[d] * fp_keys[k_offset + d];
+        }
+        score = dot * scale;
+    }
+
+    // ====== Online softmax within block ======
+    // Step 1: find block max via SIMD reduction
+    float block_max = simd_max(score);
+    if (simd_lane == 0) shared_scratch[simd_id] = block_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float gmax = shared_scratch[0];
+        uint n_simd_groups = (BLOCK_SIZE + 31) / 32;
+        for (uint s = 1; s < n_simd_groups; s++) gmax = max(gmax, shared_scratch[s]);
+        shared_scratch[0] = gmax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    block_max = shared_scratch[0];
+
+    // Step 2: exp and sum
+    float exp_score = (t < T_kv) ? exp(score - block_max) : 0.0f;
+    float block_sum = simd_sum(exp_score);
+    if (simd_lane == 0) shared_scratch[simd_id] = block_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float gsum = 0.0f;
+        uint n_simd_groups = (BLOCK_SIZE + 31) / 32;
+        for (uint s = 0; s < n_simd_groups; s++) gsum += shared_scratch[s];
+        shared_scratch[0] = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_sum = shared_scratch[0];
+
+    // Weight for this token (unnormalized — we store block_sum for pass 2 to normalize)
+    float weight = exp_score;  // NOT divided by total_sum — pass 2 handles global normalization
+
+    // ====== V weighted sum: unpack turbo4 and accumulate ======
+    // Each thread unpacks V[t] for its token and scales by weight
+    float v_local[256];  // register file — one per dim element
+    for (int dd = 0; dd < dim_val; dd++) v_local[dd] = 0.0f;
+
+    if (t < T_kv && weight > 0.0f) {
+        float wn = weight * v_norms[vn_base + t];
+        int pv_offset = pv_base + t * packed_dim;
+
+        for (int pw = 0; pw < packed_dim; pw++) {
+            uint word = packed_v[pv_offset + pw];
+            int base_d = pw * 8;
+
+            for (int j = 0; j < 8 && (base_d + j) < dim_val; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                v_local[base_d + j] = wn * centroids[idx];
+            }
+        }
+    }
+
+    // ====== Reduce V accumulators across threads in block (SIMD + shared mem) ======
+    // With BLOCK_SIZE=64 and dim up to 256, we may have fewer threads than dims.
+    // Each SIMD group reduces internally via simd_sum, then we merge across groups.
+    uint n_simd_groups = (BLOCK_SIZE + 31) / 32;
+    for (int dd = 0; dd < dim_val; dd++) {
+        float val = simd_sum(v_local[dd]);
+        if (simd_lane == 0) shared_v_reduce[simd_id * dim_val + dd] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stride loop: each thread writes multiple dim elements (BLOCK_SIZE threads, dim dims)
+    for (int dd = (int)tid; dd < dim_val; dd += BLOCK_SIZE) {
+        float total = 0.0f;
+        for (uint s = 0; s < n_simd_groups; s++) {
+            total += shared_v_reduce[s * dim_val + dd];
+        }
+        // partial_out[bh_idx, block_id, dd]
+        partial_out[bh_idx * n_blocks * dim_val + block_id * dim_val + dd] = total;
+    }
+
+    // Thread 0 writes block_max and block_sum
+    if (tid == 0) {
+        partial_max[bh_idx * n_blocks + block_id] = block_max;
+        partial_sum[bh_idx * n_blocks + block_id] = total_sum;
+    }
+"""
+
+_TWO_PASS_ATTN_P2_SOURCE_4BIT = """
+    // Two-pass fused asymmetric attention — PASS 2 (merge + inverse WHT)
+    //
+    // Grid: (n_bh, 1, 1)
+    // Threadgroup: (tg_size, 1, 1) where tg_size >= dim (for WHT butterfly)
+    //
+    // Merges partial results from Pass 1 across all blocks using online softmax
+    // correction, then applies inverse WHT rotation.
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint bh_idx = threadgroup_position_in_grid.x;
+
+    int dim_val = params[0];
+    int n_blocks = params[1];
+
+    // Shared memory for merge + WHT
+    threadgroup float shared_out[256];
+
+    // ====== Step 1: Find global max across all blocks ======
+    // Single thread scans — n_blocks is typically small (T/64)
+    threadgroup float shared_global_max[1];
+    threadgroup float shared_global_sum[1];
+
+    if (tid == 0) {
+        float gmax = -INFINITY;
+        for (int b = 0; b < n_blocks; b++) {
+            gmax = max(gmax, partial_max[bh_idx * n_blocks + b]);
+        }
+        shared_global_max[0] = gmax;
+
+        // Compute global exp sum with correction
+        float gsum = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float correction = exp(partial_max[bh_idx * n_blocks + b] - gmax);
+            gsum += correction * partial_sum[bh_idx * n_blocks + b];
+        }
+        shared_global_sum[0] = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = shared_global_max[0];
+    float global_sum = shared_global_sum[0];
+    float inv_global_sum = 1.0f / global_sum;
+
+    // ====== Step 2: Merge partial outputs with softmax correction ======
+    if ((int)tid < dim_val) {
+        float accum = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float correction = exp(partial_max[bh_idx * n_blocks + b] - global_max);
+            float block_val = partial_out[bh_idx * n_blocks * dim_val + b * dim_val + tid];
+            accum += correction * block_val;
+        }
+        // Normalize by global softmax sum
+        shared_out[tid] = accum * inv_global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ====== Step 3: Inverse WHT rotation ======
+    if ((int)tid < dim_val) {
+        shared_out[tid] *= signs2[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((int)tid < dim_val) {
+        uint log2_dim = 0;
+        for (uint dd = dim_val; dd > 1; dd >>= 1) log2_dim++;
+
+        for (uint stage = 0; stage < log2_dim; stage++) {
+            uint half_block = 1u << stage;
+            uint bfly_size = half_block << 1;
+            uint bfly_idx = tid / bfly_size;
+            uint local_idx = tid % bfly_size;
+            uint base_idx = bfly_idx * bfly_size;
+
+            float a = shared_out[base_idx + (local_idx % half_block)];
+            float b = shared_out[base_idx + (local_idx % half_block) + half_block];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            shared_out[tid] = (local_idx < half_block) ? (a + b) : (a - b);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float inv_sqrt_dim = rsqrt((float)dim_val);
+        output[bh_idx * dim_val + tid] = shared_out[tid] * inv_sqrt_dim * signs1[tid];
+    }
+"""
+
+# Cache for the two-pass kernels
+_two_pass_kernel_cache: Dict[str, object] = {}
+
+
+def _get_two_pass_kernels(bits: int = 4):
+    """Get or compile the two-pass asymmetric attention kernels (pass1 + pass2)."""
+    cache_key = f"two_pass_{bits}bit"
+    if cache_key in _two_pass_kernel_cache:
+        return _two_pass_kernel_cache[cache_key]
+
+    if bits != 4:
+        raise NotImplementedError(
+            f"Two-pass asymmetric attention only supports 4-bit V, got {bits}-bit"
+        )
+
+    # Pass 1: block scoring + partial V accumulation
+    pass1_kernel = mx.fast.metal_kernel(
+        name="turbo_two_pass_p1_4bit",
+        input_names=[
+            "queries",     # [B*nq, dim] float32
+            "fp_keys",     # [B*nkv, T_kv, dim] float16/32
+            "packed_v",    # [B*nkv, T_kv, packed_dim] uint32
+            "v_norms",     # [B*nkv, T_kv] float32
+            "centroids",   # [16] float32
+            "params",      # [7] uint32 — dim, T_kv, packed_dim, scale, gqa, block_size, n_blocks
+        ],
+        output_names=[
+            "partial_out",  # [n_bh, n_blocks, dim] float32
+            "partial_max",  # [n_bh, n_blocks] float32
+            "partial_sum",  # [n_bh, n_blocks] float32
+        ],
+        header=_FUSED_ASYMMETRIC_ATTN_HEADER,
+        source=_TWO_PASS_ATTN_P1_SOURCE_4BIT,
+        ensure_row_contiguous=True,
+        atomic_outputs=False,
+    )
+
+    # Pass 2: merge partials + inverse WHT
+    pass2_kernel = mx.fast.metal_kernel(
+        name="turbo_two_pass_p2_4bit",
+        input_names=[
+            "partial_out",  # [n_bh, n_blocks, dim] float32
+            "partial_max",  # [n_bh, n_blocks] float32
+            "partial_sum",  # [n_bh, n_blocks] float32
+            "signs1",       # [dim] float32
+            "signs2",       # [dim] float32
+            "params",       # [2] uint32 — dim, n_blocks
+        ],
+        output_names=[
+            "output",       # [n_bh, dim] float32
+        ],
+        header="",
+        source=_TWO_PASS_ATTN_P2_SOURCE_4BIT,
+        ensure_row_contiguous=True,
+        atomic_outputs=False,
+    )
+
+    _two_pass_kernel_cache[cache_key] = (pass1_kernel, pass2_kernel)
+    return pass1_kernel, pass2_kernel
+
+
+def turbo_two_pass_asymmetric_attention(
+    queries: mx.array,
+    fp_keys: mx.array,
+    packed_values: mx.array,
+    value_norms: mx.array,
+    dim: int,
+    bits: int = 4,
+    seed: int = 42,
+    scale: Optional[float] = None,
+    block_size: int = _TWO_PASS_BLOCK_SIZE,
+) -> mx.array:
+    """Two-pass fused asymmetric attention: K=FP16, V=turbo4 (TurboFlash).
+
+    Eric Kryski's TurboFlash architecture: two-pass with B=64 blocks.
+    Pass 1 runs T/64 threadgroups in parallel (one per block), each computing
+    partial softmax + weighted V sum. Pass 2 merges block results with online
+    softmax correction and applies inverse WHT.
+
+    Scales much better than single-pass because the GPU can run all pass-1
+    blocks in parallel instead of serializing T_kv iterations in one threadgroup.
+
+    Args:
+        queries: Query tensor, shape (B, n_q_heads, 1, dim).
+        fp_keys: Raw FP16 keys, shape (B, n_kv_heads, T_kv, dim).
+        packed_values: Packed V indices, shape (B, n_kv_heads, T_kv, packed_dim).
+        value_norms: V norms, shape (B, n_kv_heads, T_kv, 1).
+        dim: Head dimension (must be power of 2, max 256).
+        bits: V quantization bit-width. Default: 4.
+        seed: SRHT seed. Default: 42.
+        scale: Attention scale. Default: 1/sqrt(dim).
+        block_size: KV tokens per block. Default: 64 (Eric's optimal).
+
+    Returns:
+        Attention output, shape (B, n_q_heads, 1, dim).
+
+    Example:
+        >>> cache = TurboKVCache(bits=4, key_bits=0)  # K=FP16, V=turbo4
+        >>> out = turbo_two_pass_asymmetric_attention(
+        ...     q, cache._fp_keys, cache._packed_values,
+        ...     cache._value_norms, dim=128)
+    """
+    if bits != 4:
+        raise NotImplementedError(
+            f"Two-pass asymmetric attention only supports 4-bit V, got {bits}-bit"
+        )
+    if dim > 256:
+        raise ValueError(
+            f"Two-pass asymmetric attention supports dim <= 256, got dim={dim}. "
+            "The kernel uses fixed-size shared memory arrays."
+        )
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(dim)
+
+    B = queries.shape[0]
+    n_q_heads = queries.shape[1]
+    T_kv = fp_keys.shape[2]
+    n_kv_heads = fp_keys.shape[1]
+    packed_dim = packed_values.shape[-1]
+
+    # GQA factor: how many query heads per KV head
+    gqa_factor = n_q_heads // n_kv_heads if n_kv_heads < n_q_heads else 1
+
+    # Get codebook centroids and sign vectors
+    cb = _get_codebook(bits, dim)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+
+    # Flatten inputs for kernel
+    n_bq = B * n_q_heads
+    n_bkv = B * n_kv_heads
+    n_blocks = (T_kv + block_size - 1) // block_size
+
+    # Queries: (B, nq, 1, dim) -> (B*nq, dim)
+    q_flat = queries.reshape(n_bq, dim).astype(mx.float32)
+
+    # Keys: (B, nkv, T_kv, dim) -> (B*nkv, T_kv, dim)
+    k_flat = fp_keys.reshape(n_bkv, T_kv, dim).astype(mx.float32)
+
+    # Packed V: (B, nkv, T_kv, packed_dim) -> (B*nkv, T_kv, packed_dim)
+    pv_flat = packed_values.reshape(n_bkv, T_kv, packed_dim)
+
+    # V norms: (B, nkv, T_kv, 1) -> (B*nkv, T_kv)
+    vn_flat = value_norms.squeeze(-1).reshape(n_bkv, T_kv).astype(mx.float32)
+
+    # Encode scale as uint32 for integer param array
+    import struct
+    scale_as_uint32 = struct.unpack('I', struct.pack('f', scale))[0]
+
+    # Pass 1 params: dim, T_kv, packed_dim, scale, gqa_factor, block_size, n_blocks
+    p1_params = mx.array(
+        [dim, T_kv, packed_dim, scale_as_uint32, gqa_factor, block_size, n_blocks],
+        dtype=mx.uint32,
+    )
+
+    pass1_kernel, pass2_kernel = _get_two_pass_kernels(bits)
+
+    # === Pass 1: block scoring + partial V accumulation ===
+    # Grid: (n_bq, n_blocks, 1) — one threadgroup per (query_head, block) pair
+    # Threadgroup: (block_size, 1, 1) — one thread per KV token in block
+    p1_outputs = pass1_kernel(
+        inputs=[
+            q_flat,           # queries
+            k_flat,           # fp_keys
+            pv_flat,          # packed_v
+            vn_flat,          # v_norms
+            cb.centroids,     # centroids
+            p1_params,        # params
+        ],
+        output_shapes=[
+            (n_bq, n_blocks, dim),   # partial_out
+            (n_bq, n_blocks),        # partial_max
+            (n_bq, n_blocks),        # partial_sum
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        grid=(n_bq * block_size, n_blocks, 1),
+        threadgroup=(block_size, 1, 1),
+        init_value=0.0,
+        stream=mx.gpu,
+    )
+
+    partial_out = p1_outputs[0]
+    partial_max = p1_outputs[1]
+    partial_sum = p1_outputs[2]
+
+    # === Pass 2: merge partials + inverse WHT ===
+    # Grid: (n_bq, 1, 1) — one threadgroup per query head
+    # Threadgroup: (tg_size, 1, 1) — at least dim threads for WHT butterfly
+    tg_size = max(dim, 64)
+    tg_size = ((tg_size + 31) // 32) * 32  # round to SIMD boundary
+    tg_size = min(tg_size, 256)
+
+    # Pass 2 params: dim, n_blocks
+    p2_params = mx.array([dim, n_blocks], dtype=mx.uint32)
+
+    p2_outputs = pass2_kernel(
+        inputs=[
+            partial_out,   # partial_out
+            partial_max,   # partial_max
+            partial_sum,   # partial_sum
+            signs1,        # signs1
+            signs2,        # signs2
+            p2_params,     # params
+        ],
+        output_shapes=[
+            (n_bq, dim),   # output
+        ],
+        output_dtypes=[mx.float32],
+        grid=(n_bq * tg_size, 1, 1),
+        threadgroup=(tg_size, 1, 1),
+        init_value=0.0,
+        stream=mx.gpu,
+    )
+
+    output = p2_outputs[0].reshape(B, n_q_heads, 1, dim)
+    return output.astype(queries.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Fused compressed-domain attention (Metal kernel — no FP16 materialization)
 # ---------------------------------------------------------------------------
 
@@ -4131,8 +4615,8 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
             )
 
         # Asymmetric fused path: K=FP16, V=turbo4
-        # Single-dispatch kernel fuses Q×K scoring, softmax, V weighted sum,
-        # and inverse WHT into ONE Metal dispatch (~0.15ms vs 0.704ms for 4 dispatches).
+        # Two-pass kernel (TurboFlash, B=64) is default — massive parallelism.
+        # Set TURBO_ASYMMETRIC_SINGLE=1 to use single-pass (one TG per head).
         # Set TURBO_ASYMMETRIC_LEGACY=1 to fall back to the 4-dispatch version.
         if (
             isinstance(cache, TurboKVCache)
@@ -4153,7 +4637,7 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
             if hasattr(cache, '_flush_pending'):
                 cache._flush_pending()
 
-            # Use fused single-dispatch kernel by default, legacy 4-dispatch as fallback
+            # Dispatch hierarchy: two-pass (default) > single-pass > legacy 4-dispatch
             if os.environ.get("TURBO_ASYMMETRIC_LEGACY", "0") == "1":
                 return turbo_asymmetric_attention(
                     queries,
@@ -4165,7 +4649,19 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
                     seed=cache.seed,
                     scale=scale,
                 )
-            return turbo_fused_asymmetric_attention_single_dispatch(
+            if os.environ.get("TURBO_ASYMMETRIC_SINGLE", "0") == "1":
+                return turbo_fused_asymmetric_attention_single_dispatch(
+                    queries,
+                    cache._fp_keys,
+                    cache._packed_values,
+                    cache._value_norms,
+                    dim=cache._dim,
+                    bits=cache.v_bits,
+                    seed=cache.seed,
+                    scale=scale,
+                )
+            # Default: two-pass TurboFlash (Eric Kryski's B=64 architecture)
+            return turbo_two_pass_asymmetric_attention(
                 queries,
                 cache._fp_keys,
                 cache._packed_values,
