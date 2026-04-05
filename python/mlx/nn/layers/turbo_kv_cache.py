@@ -2530,6 +2530,12 @@ class TurboKVCache:
         # the double-storage problem. Requires symmetric 4-bit, Metal GPU.
         self._fused_attention = fused_attention
 
+        # Set by patch_mlx_lm() — when True, update_and_fetch skips decode
+        # and returns dummy K/V. The patched SDPA intercepts and calls
+        # turbo_fused_attention on packed data directly. This eliminates the
+        # double-storage problem without requiring model code changes.
+        self._patched = False
+
         # Raw (uncompressed) storage — used during prefill
         self._raw_keys: Optional[mx.array] = None
         self._raw_values: Optional[mx.array] = None
@@ -2582,11 +2588,14 @@ class TurboKVCache:
         # Check if we should go straight into compact mode (e.g., prefill
         # was longer than compact_threshold — no point seeding decoded FP16
         # just to immediately drop it).
+        # Also skip decoded FP16 when patched — the monkey-patched SDPA will
+        # call turbo_fused_attention directly on packed data, so decoded FP16
+        # would just waste memory (the whole point of patching).
         skip_decoded = (
-            self.compact_threshold > 0
-            and self.offset > self.compact_threshold
+            (self.compact_threshold > 0 and self.offset > self.compact_threshold)
+            or self._patched
         )
-        if skip_decoded:
+        if skip_decoded and not self._patched:
             self._compact_mode = True
 
         if self.compress_keys:
@@ -2695,6 +2704,60 @@ class TurboKVCache:
         # --- Decode phase: encode new token(s), append, return decoded ---
         self.offset += num_steps
         dim = self._dim
+
+        # --- Patched fast path: encode-only, no decode ---
+        # When patch_mlx_lm() is active, the SDPA function is monkey-patched
+        # to call turbo_fused_attention directly on packed data. We still need
+        # to encode new tokens into packed storage, but we skip ALL decode
+        # work (no FP16 buffers created). Return the raw new keys/values as
+        # dummy sentinels — the patched SDPA ignores them.
+        _can_fuse_patched = (
+            self._patched
+            and num_steps == 1
+            and self.compress_keys
+            and self.compress_values
+            and self.k_bits == self.v_bits == 4
+            and dim is not None
+            and dim <= 256
+            and mx.metal.is_available()
+        )
+        if _can_fuse_patched:
+            # Encode and append keys
+            new_pk, new_kn = turbo_encode(
+                keys, bits=self.k_bits, seed=self.seed,
+                block_size=self.block_size,
+            )
+            if self._packed_keys is not None:
+                self._packed_keys = mx.concatenate(
+                    [self._packed_keys, new_pk], axis=2,
+                )
+                self._key_norms = mx.concatenate(
+                    [self._key_norms, new_kn], axis=2,
+                )
+            else:
+                self._packed_keys = new_pk
+                self._key_norms = new_kn
+
+            # Encode and append values
+            new_pv, new_vn = turbo_encode(
+                values, bits=self.v_bits, seed=self.seed,
+                block_size=self.block_size,
+            )
+            if self._packed_values is not None:
+                self._packed_values = mx.concatenate(
+                    [self._packed_values, new_pv], axis=2,
+                )
+                self._value_norms = mx.concatenate(
+                    [self._value_norms, new_vn], axis=2,
+                )
+            else:
+                self._packed_values = new_pv
+                self._value_norms = new_vn
+
+            # Return raw keys/values as dummy — patched SDPA will ignore these
+            # and call turbo_fused_attention on packed data instead.
+            # No FP16 decode buffers allocated. This is the whole point.
+            return keys, values
 
         # --- Compact mode transition ---
         # Once we exceed compact_threshold, drop the decoded FP16 caches to
@@ -3041,8 +3104,148 @@ class TurboKVCache:
         v_desc = f"v={self.v_bits}bit" if self.compress_values else "v=fp"
         bs_desc = f"block={self.block_size}" if self.block_size > 0 else "block=full"
         compact_desc = f"compact@{self.compact_threshold}" if self.compact_threshold > 0 else "no-compact"
+        patched = ", patched" if self._patched else ""
         return (
             f"TurboKVCache({k_desc}, {v_desc}, {bs_desc}, {mode}, "
             f"offset={self.offset}, dim={self._dim}, "
-            f"min_compress={self.min_compress_tokens}, {compact_desc})"
+            f"min_compress={self.min_compress_tokens}, {compact_desc}{patched})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch mechanism for mlx-lm integration
+# ---------------------------------------------------------------------------
+
+# Stash for the original SDPA function, so unpatch can restore it.
+_original_sdpa = None
+
+
+def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
+    """Monkey-patch mlx-lm to use fused turbo attention when TurboKVCache is active.
+
+    Call once before model inference. Replaces the ``scaled_dot_product_attention``
+    function in ``mlx_lm.models.base`` with a turbo-aware version that detects
+    ``TurboKVCache`` and routes to the fused Metal kernel.
+
+    This eliminates the double-storage problem: ``update_and_fetch`` no longer
+    materializes decoded FP16 buffers when the patched SDPA will call
+    ``turbo_fused_attention`` directly on packed data.
+
+    The patch is transparent to non-turbo caches — standard ``KVCache``,
+    ``RotatingKVCache``, and quantized caches all take the original code path.
+
+    Args:
+        cache_list: Optional list of ``TurboKVCache`` instances to mark as
+            patched. If ``None``, the patch still installs but individual caches
+            must have ``_patched = True`` set manually. When provided, sets
+            ``_patched = True`` on all ``TurboKVCache`` instances in the list.
+
+    Example:
+        >>> import mlx_lm
+        >>> from mlx.nn.layers.turbo_kv_cache import TurboKVCache, patch_mlx_lm
+        >>> model, tokenizer = mlx_lm.load('mlx-community/Qwen3.5-2B-8bit')
+        >>> n_layers = len(model.model.layers)
+        >>> cache = [TurboKVCache(bits=4, key_bits=4) for _ in range(n_layers)]
+        >>> patch_mlx_lm(cache)  # Install once before generation
+        >>> text = mlx_lm.generate(model, tokenizer, prompt='Hello',
+        ...                        max_tokens=100, prompt_cache=cache)
+    """
+    global _original_sdpa
+
+    try:
+        import mlx_lm.models.base as base
+    except ImportError:
+        raise ImportError(
+            "mlx-lm is not installed. Install with: pip install mlx-lm"
+        )
+
+    # Don't double-patch
+    if _original_sdpa is not None:
+        # Already patched — just mark any new caches
+        if cache_list is not None:
+            for c in cache_list:
+                if isinstance(c, TurboKVCache):
+                    c._patched = True
+        return
+
+    _original_sdpa = base.scaled_dot_product_attention
+
+    def turbo_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
+        """Turbo-aware SDPA: routes to fused attention for TurboKVCache.
+
+        When the cache is a patched TurboKVCache with compressed 4-bit K/V,
+        the keys/values args (from update_and_fetch) are dummy sentinels.
+        We ignore them and call turbo_fused_attention on the packed data
+        stored in the cache object directly.
+
+        For all other cache types, delegates to the original SDPA unchanged.
+        """
+        # Check if this is a patched TurboKVCache that can use the fused path
+        if (
+            isinstance(cache, TurboKVCache)
+            and cache._patched
+            and cache._is_compressed
+            and cache.compress_keys
+            and cache.compress_values
+            and cache.k_bits == cache.v_bits == 4
+            and cache._packed_keys is not None
+            and cache._packed_values is not None
+            and queries.shape[2] <= 2  # T_q=1 or 2 (decode only)
+            and mask is None  # Fused kernel doesn't support masks yet
+            and cache._dim is not None
+            and cache._dim <= 256
+            and mx.metal.is_available()
+        ):
+            # Fused attention directly on packed data — no FP16 materialized
+            return turbo_fused_attention(
+                queries,
+                cache._packed_keys,
+                cache._key_norms,
+                cache._packed_values,
+                cache._value_norms,
+                dim=cache._dim,
+                bits=cache.v_bits,
+                seed=cache.seed,
+                scale=scale,
+            )
+
+        # Fallback: original SDPA for non-turbo caches, prefill, masked, etc.
+        return _original_sdpa(queries, keys, values, cache, scale, mask, sinks)
+
+    base.scaled_dot_product_attention = turbo_sdpa
+
+    # Mark caches as patched so update_and_fetch skips decode
+    if cache_list is not None:
+        for c in cache_list:
+            if isinstance(c, TurboKVCache):
+                c._patched = True
+
+
+def unpatch_mlx_lm(cache_list: Optional[list] = None) -> None:
+    """Restore the original mlx-lm SDPA function.
+
+    Reverses the effect of ``patch_mlx_lm()``. Also clears the ``_patched``
+    flag on any caches in the provided list so ``update_and_fetch`` resumes
+    normal decode behavior.
+
+    Args:
+        cache_list: Optional list of caches to un-mark. If ``None``, only
+            the global SDPA is restored.
+    """
+    global _original_sdpa
+
+    if _original_sdpa is None:
+        return  # Nothing to unpatch
+
+    try:
+        import mlx_lm.models.base as base
+        base.scaled_dot_product_attention = _original_sdpa
+    except ImportError:
+        pass
+
+    _original_sdpa = None
+
+    if cache_list is not None:
+        for c in cache_list:
+            if isinstance(c, TurboKVCache):
+                c._patched = False

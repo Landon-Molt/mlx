@@ -105,9 +105,11 @@ from mlx.nn.layers.transformer import (
 from mlx.nn.layers.turbo_kv_cache import (
     TurboQuantCodebook,
     TurboQuantKVCache,
+    patch_mlx_lm,
     turbo_attention,
     turbo_decode,
     turbo_encode,
     turbo_fused_attention,
+    unpatch_mlx_lm,
 )
 from mlx.nn.layers.upsample import Upsample
