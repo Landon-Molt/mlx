@@ -1223,6 +1223,310 @@ def turbo_attention(
 
 
 # ---------------------------------------------------------------------------
+# Asymmetric fused attention: FP16 K scoring + turbo V weighted sum
+# ---------------------------------------------------------------------------
+# For asymmetric config (K=FP16, V=turbo4), the scoring phase (Q × K^T) uses
+# raw FP16 keys — standard matmul, already fast. Only the V weighted sum
+# needs to touch packed data. This kernel takes pre-computed attention weights
+# and does weighted centroid lookup directly on packed V, avoiding full V decode.
+#
+# This is simpler than the full fused kernel because scores are already computed.
+# It's just: for each dim, sum over t of: weight[t] * centroid[packed_v[t][d]] * norm[t]
+# Then inverse-rotate once in Python.
+# ---------------------------------------------------------------------------
+
+_TURBO_WEIGHTED_V_SUM_HEADER = """
+// Inline unpack: extract a 4-bit index from a uint32 word
+inline uint unpack4(uint word, uint pos) {
+    return (word >> (pos * 4)) & 0xF;
+}
+"""
+
+_TURBO_WEIGHTED_V_SUM_SOURCE = """
+    // Grid: one threadgroup per (batch, head) pair
+    // Threadgroup: (TG_SIZE, 1, 1) — threads split T_kv work
+    //
+    // Inputs:
+    //   weights:      [n_bh, T_kv]              — post-softmax attention weights
+    //   packed_v:     [n_bh, T_kv, packed_dim]   — packed 4-bit V indices
+    //   v_norms:      [n_bh, T_kv]              — V L2 norms
+    //   centroids:    [n_levels]                  — centroid lookup table
+    //   params:       [3]                         — {dim, T_kv, packed_dim}
+    //
+    // Outputs:
+    //   out_accum:    [n_bh, dim]               — WHT-domain weighted sum
+    //   simd_scratch: [n_bh, n_simd_groups]     — scratch for simd reductions
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint tg_size = threads_per_threadgroup.x;
+    uint bh_idx = threadgroup_position_in_grid.x;
+
+    int dim = params[0];
+    int T_kv = params[1];
+    int packed_dim = params[2];
+
+    // Base offsets for this (batch, head)
+    int w_base = bh_idx * T_kv;
+    int pv_base = bh_idx * T_kv * packed_dim;
+
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_id = tid / threads_per_simdgroup;
+    uint n_simd = (tg_size + threads_per_simdgroup - 1) / threads_per_simdgroup;
+    int scratch_base = bh_idx * n_simd;
+
+    // Local V accumulator in registers
+    float v_accum[256];
+    for (int d = 0; d < dim; d++) {
+        v_accum[d] = 0.0f;
+    }
+
+    // Each thread processes a strided subset of T_kv tokens
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float w = weights[w_base + t];
+
+        // Sparse V skip: don't bother with near-zero weights
+        if (w < 1e-6f) continue;
+
+        float norm_v = v_norms[w_base + t];
+        float wn = w * norm_v;
+
+        int pv_offset = pv_base + t * packed_dim;
+        for (int pw = 0; pw < packed_dim; pw++) {
+            uint word = packed_v[pv_offset + pw];
+            int base_d = pw * 8;  // 8 x 4-bit indices per uint32
+
+            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                float c = centroids[idx];
+                v_accum[base_d + j] += wn * c;
+            }
+        }
+    }
+
+    // Reduce V accumulators across threads via simd_sum + cross-simd reduce
+    for (int d = 0; d < dim; d++) {
+        float val = simd_sum(v_accum[d]);
+
+        if (simd_lane == 0) {
+            simd_scratch[scratch_base + simd_id] = val;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        if (tid == 0) {
+            float total = 0.0f;
+            for (uint s = 0; s < n_simd; s++) {
+                total += simd_scratch[scratch_base + s];
+            }
+            out_accum[bh_idx * dim + d] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+"""
+
+# Cache for the compiled weighted V sum kernel
+_weighted_v_sum_kernel_cache: Dict[Tuple[int, int], object] = {}
+
+
+def _get_weighted_v_sum_kernel(bits: int, nr0: int = 1):
+    """Get or compile the weighted V sum Metal kernel."""
+    cache_key = (bits, nr0)
+    if cache_key in _weighted_v_sum_kernel_cache:
+        return _weighted_v_sum_kernel_cache[cache_key]
+
+    if bits != 4:
+        raise NotImplementedError(
+            f"turbo_weighted_value_sum only supports 4-bit, got {bits}-bit"
+        )
+
+    source = _TURBO_WEIGHTED_V_SUM_SOURCE
+    header = _TURBO_WEIGHTED_V_SUM_HEADER
+
+    kernel = mx.fast.metal_kernel(
+        name=f"turbo_weighted_v_sum_{bits}bit",
+        input_names=["weights", "packed_v", "v_norms", "centroids", "params"],
+        output_names=["out_accum", "simd_scratch"],
+        header=header,
+        source=source,
+    )
+    _weighted_v_sum_kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def turbo_weighted_value_sum(
+    attention_weights: mx.array,
+    packed_values: mx.array,
+    value_norms: mx.array,
+    dim: int,
+    bits: int = 4,
+    seed: int = 42,
+) -> mx.array:
+    """Weighted sum of turbo-quantized values using pre-computed attention weights.
+
+    For asymmetric attention (K=FP16, V=turbo4): the scoring phase uses raw FP16
+    keys with standard matmul. This function handles only the V weighted sum —
+    it takes post-softmax attention weights and computes the output directly from
+    packed V data without decoding V to FP16 first.
+
+    Metal kernel: for each output element (batch, head, dim_idx):
+      val = sum over t of: weight[t] * centroid[packed_v[t][dim_idx]] * norm[t]
+    Then inverse-rotate in Python: signs1 * WHT(signs2 * val)
+
+    This eliminates the #1 gap in asymmetric config: V decode overhead that
+    previously required full turbo_decode() every step.
+
+    Args:
+        attention_weights: Post-softmax weights, shape (B, n_q_heads, 1, T_kv).
+        packed_values: Packed V indices, shape (B, n_kv_heads, T_kv, packed_dim).
+        value_norms: V norms, shape (B, n_kv_heads, T_kv, 1).
+        dim: Head dimension (must be power of 2, max 256).
+        bits: Quantization bit-width. Default: 4.
+        seed: SRHT random seed (must match encode). Default: 42.
+
+    Returns:
+        Attention output in original domain, shape (B, n_q_heads, 1, dim).
+
+    Example:
+        >>> # Asymmetric: FP16 K scoring, turbo4 V weighted sum
+        >>> scores = (q @ fp16_keys.transpose(0, 1, 3, 2)) * scale
+        >>> weights = mx.softmax(scores, axis=-1)
+        >>> pv, vn = turbo_encode(values, bits=4)
+        >>> out = turbo_weighted_value_sum(weights, pv, vn, dim=128)
+    """
+    if bits != 4:
+        raise NotImplementedError(
+            f"turbo_weighted_value_sum only supports 4-bit, got {bits}-bit"
+        )
+    if dim > 256:
+        raise ValueError(
+            f"turbo_weighted_value_sum supports dim <= 256, got dim={dim}"
+        )
+
+    B = attention_weights.shape[0]
+    n_q_heads = attention_weights.shape[1]
+    T_kv = attention_weights.shape[-1]
+    n_kv_heads = packed_values.shape[1]
+    packed_dim = packed_values.shape[-1]
+
+    # Handle GQA: expand KV heads to match query heads if needed
+    if n_kv_heads < n_q_heads:
+        gqa_factor = n_q_heads // n_kv_heads
+        packed_values = mx.repeat(packed_values, gqa_factor, axis=1)
+        value_norms = mx.repeat(value_norms, gqa_factor, axis=1)
+
+    # Get codebook centroids
+    cb = _get_codebook(bits, dim)
+
+    # Flatten for kernel: (B*n_q_heads, ...)
+    n_bh = B * n_q_heads
+    weights_flat = attention_weights.reshape(n_bh, T_kv).astype(mx.float32)
+    pv_flat = packed_values.reshape(n_bh, T_kv, packed_dim)
+    vn_flat = value_norms.squeeze(-1).reshape(n_bh, T_kv).astype(mx.float32)
+
+    # Params
+    params = mx.array([dim, T_kv, packed_dim], dtype=mx.uint32)
+
+    # Kernel launch config
+    tg_size = min(64, max(32, T_kv))
+    tg_size = ((tg_size + 31) // 32) * 32
+    n_simd_groups = tg_size // 32
+
+    kernel = _get_weighted_v_sum_kernel(bits)
+
+    outputs = kernel(
+        inputs=[
+            weights_flat,       # weights
+            pv_flat,            # packed_v
+            vn_flat,            # v_norms
+            cb.centroids,       # centroids
+            params,             # params
+        ],
+        output_shapes=[
+            (n_bh, dim),              # out_accum
+            (n_bh, n_simd_groups),    # simd_scratch
+        ],
+        output_dtypes=[mx.float32, mx.float32],
+        grid=(n_bh * tg_size, 1, 1),
+        threadgroup=(tg_size, 1, 1),
+        init_value=0.0,
+        stream=mx.gpu,
+    )
+
+    out_rot = outputs[0]  # (n_bh, dim) — in WHT domain
+
+    # Inverse transform: signs1 * WHT(signs2 * out_rot)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+    out_rot = out_rot.reshape(B, n_q_heads, 1, dim)
+    out_transformed = mx.hadamard_transform(out_rot * signs2)
+    output = out_transformed * signs1
+
+    return output.astype(attention_weights.dtype)
+
+
+def turbo_asymmetric_attention(
+    queries: mx.array,
+    fp_keys: mx.array,
+    packed_values: mx.array,
+    value_norms: mx.array,
+    dim: int,
+    bits: int = 4,
+    seed: int = 42,
+    scale: Optional[float] = None,
+) -> mx.array:
+    """Asymmetric fused attention: FP16 K scoring + turbo V weighted sum.
+
+    The optimal path for K=FP16, V=turbo4 — the recommended config. Scores are
+    computed with standard matmul on raw FP16 keys (no decode needed), then the
+    V weighted sum uses the Metal kernel on packed data (no V decode needed).
+
+    This eliminates the decode overhead that was the #1 gap in asymmetric mode.
+
+    Args:
+        queries: Query tensor, shape (B, n_q_heads, 1, dim).
+        fp_keys: Raw FP16 keys, shape (B, n_kv_heads, T_kv, dim).
+        packed_values: Packed V indices, shape (B, n_kv_heads, T_kv, packed_dim).
+        value_norms: V norms, shape (B, n_kv_heads, T_kv, 1).
+        dim: Head dimension.
+        bits: V quantization bit-width. Default: 4.
+        seed: SRHT seed. Default: 42.
+        scale: Attention scale. Default: 1/sqrt(dim).
+
+    Returns:
+        Attention output, shape (B, n_q_heads, 1, dim).
+
+    Example:
+        >>> cache = TurboKVCache(bits=4, key_bits=0)  # K=FP16, V=turbo4
+        >>> # After prefill + compression:
+        >>> out = turbo_asymmetric_attention(q, cache._fp_keys, cache._packed_values,
+        ...                                  cache._value_norms, dim=128)
+    """
+    if scale is None:
+        scale = 1.0 / math.sqrt(dim)
+
+    n_kv_heads = fp_keys.shape[1]
+    n_q_heads = queries.shape[1]
+
+    # Handle GQA for K scoring: expand KV keys to match query heads
+    keys_for_score = fp_keys
+    if n_kv_heads < n_q_heads:
+        gqa_factor = n_q_heads // n_kv_heads
+        keys_for_score = mx.repeat(fp_keys, gqa_factor, axis=1)
+
+    # Step 1: Score with FP16 K — standard matmul, already fast
+    scores = (queries @ keys_for_score.transpose(0, 1, 3, 2)) * scale
+
+    # Step 2: Softmax
+    weights = mx.softmax(scores, axis=-1)
+
+    # Step 3: Weighted sum of turbo V — Metal kernel, no V decode
+    output = turbo_weighted_value_sum(
+        weights, packed_values, value_norms, dim, bits=bits, seed=seed,
+    )
+
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Fused compressed-domain attention (Metal kernel — no FP16 materialization)
 # ---------------------------------------------------------------------------
 
@@ -2608,6 +2912,9 @@ class TurboKVCache:
         skip_decoded = (
             (self.compact_threshold > 0 and self.offset > self.compact_threshold)
             or (self._patched and self.compress_keys and self.compress_values and self.k_bits == self.v_bits == 4)
+            # Asymmetric patched: K=FP16, V=turbo4. Skip decoded V — the patched
+            # SDPA uses turbo_asymmetric_attention which reads packed V directly.
+            or (self._patched and not self.compress_keys and self.compress_values and self.v_bits == 4)
         )
         if skip_decoded and not self._patched:
             self._compact_mode = True
@@ -2771,6 +3078,48 @@ class TurboKVCache:
             # Return raw keys/values as dummy — patched SDPA will ignore these
             # and call turbo_fused_attention on packed data instead.
             # No FP16 decode buffers allocated. This is the whole point.
+            return keys, values
+
+        # --- Patched asymmetric fast path: K=FP16 (no encode), V=turbo4 (encode-only) ---
+        # When asymmetric (compress_keys=False, compress_values=True) and patched,
+        # the SDPA uses turbo_asymmetric_attention which scores with raw FP16 K
+        # and does weighted sum on packed V. We store raw K and encode+append V.
+        # No V decode buffers allocated — eliminates the #1 gap.
+        _can_fuse_asymmetric = (
+            self._patched
+            and num_steps == 1
+            and not self.compress_keys       # K stays at FP16
+            and self.compress_values         # V is turbo-compressed
+            and self.v_bits == 4
+            and dim is not None
+            and dim <= 256
+            and mx.metal.is_available()
+        )
+        if _can_fuse_asymmetric:
+            # Append raw FP16 keys (no encode needed)
+            if self._fp_keys is not None:
+                self._fp_keys = mx.concatenate([self._fp_keys, keys], axis=2)
+            else:
+                self._fp_keys = keys
+
+            # Encode and append packed values
+            new_pv, new_vn = turbo_encode(
+                values, bits=self.v_bits, seed=self.seed,
+                block_size=self.block_size,
+            )
+            if self._packed_values is not None:
+                self._packed_values = mx.concatenate(
+                    [self._packed_values, new_pv], axis=2,
+                )
+                self._value_norms = mx.concatenate(
+                    [self._value_norms, new_vn], axis=2,
+                )
+            else:
+                self._packed_values = new_pv
+                self._value_norms = new_vn
+
+            # Return raw K + dummy V — patched SDPA uses turbo_asymmetric_attention
+            # which reads cache._fp_keys and cache._packed_values directly.
             return keys, values
 
         # --- Compact mode transition ---
@@ -3192,6 +3541,10 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
         We ignore them and call turbo_fused_attention on the packed data
         stored in the cache object directly.
 
+        For asymmetric config (K=FP16, V=turbo4), uses the asymmetric path:
+        standard matmul on raw FP16 K for scoring, Metal kernel on packed V
+        for the weighted sum. No V decode overhead.
+
         For all other cache types, delegates to the original SDPA unchanged.
         """
         # Check if this is a patched TurboKVCache that can use the fused path
@@ -3215,6 +3568,35 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
                 queries,
                 cache._packed_keys,
                 cache._key_norms,
+                cache._packed_values,
+                cache._value_norms,
+                dim=cache._dim,
+                bits=cache.v_bits,
+                seed=cache.seed,
+                scale=scale,
+            )
+
+        # Asymmetric fused path: K=FP16, V=turbo4
+        # Uses raw FP16 K for scoring (fast matmul) + Metal kernel for packed V sum
+        # No V decode overhead — the #1 gap in asymmetric mode
+        if (
+            isinstance(cache, TurboKVCache)
+            and cache._patched
+            and cache._is_compressed
+            and not cache.compress_keys     # K stays at FP16
+            and cache.compress_values       # V is turbo-compressed
+            and cache.v_bits == 4
+            and cache._fp_keys is not None
+            and cache._packed_values is not None
+            and queries.shape[2] == 1       # decode only (T_q=1)
+            and mask is None
+            and cache._dim is not None
+            and cache._dim <= 256
+            and mx.metal.is_available()
+        ):
+            return turbo_asymmetric_attention(
+                queries,
+                cache._fp_keys,
                 cache._packed_values,
                 cache._value_norms,
                 dim=cache._dim,
