@@ -4713,8 +4713,23 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
                     seed=cache.seed,
                     scale=scale,
                 )
-            # Default: two-pass TurboFlash (Eric Kryski's B=64 architecture)
-            return turbo_two_pass_asymmetric_attention(
+            # Default: asymmetric attention (K=FP16 scoring + fused V sum)
+            # Two-pass TurboFlash is available via TURBO_USE_TWO_PASS=1 but has
+            # a known performance regression at long context (>16K).
+            if os.environ.get("TURBO_USE_TWO_PASS", "0") == "1":
+                _tp_bs = int(os.environ.get("TURBO_TWO_PASS_BLOCK_SIZE", "64"))
+                return turbo_two_pass_asymmetric_attention(
+                    queries,
+                    cache._fp_keys,
+                    cache._packed_values,
+                    cache._value_norms,
+                    dim=cache._dim,
+                    bits=cache.v_bits,
+                    seed=cache.seed,
+                    scale=scale,
+                    block_size=_tp_bs,
+                )
+            return turbo_asymmetric_attention(
                 queries,
                 cache._fp_keys,
                 cache._packed_values,
@@ -4774,3 +4789,71 @@ def unpatch_mlx_lm(cache_list: Optional[list] = None) -> None:
         for c in cache_list:
             if isinstance(c, TurboKVCache):
                 c._patched = False
+
+
+def make_turbo_cache(
+    model,
+    bits: int = 4,
+    key_bits: int = 0,
+    boundary: int = 2,
+    min_compress_tokens: int = 256,
+    k_compress_threshold: int = 0,
+) -> list:
+    """One-line TurboQuant KV cache setup for mlx-lm models.
+
+    Creates TurboKVCache for middle layers, keeps boundary layers at FP16,
+    and installs the monkey-patched SDPA for fused attention routing.
+
+    Works with stock mlx-lm — no fork needed. Only requires TheTom/mlx.
+
+    Args:
+        model: The mlx-lm model (e.g., from ``mlx_lm.load()``).
+        bits (int): V quantization bit-width (2, 3, or 4). Default: 4.
+        key_bits (int): K bit-width. 0 = FP16 (recommended). Default: 0.
+        boundary (int): FP16 boundary layers at start/end. Default: 2.
+        min_compress_tokens (int): Defer compression below this. Default: 256.
+        k_compress_threshold (int): Context length to switch K from FP16 to
+            turbo4. 0 = never (pure asymmetric). Default: 0.
+
+    Returns:
+        List of cache objects to pass as ``prompt_cache``.
+
+    Example::
+
+        from mlx.nn.layers.turbo_kv_cache import make_turbo_cache
+        model, tokenizer = mlx_lm.load('mlx-community/Qwen2.5-7B-Instruct-8bit')
+        cache = make_turbo_cache(model, bits=4)
+        text = mlx_lm.generate(model, tokenizer, prompt='Hello',
+                               max_tokens=100, prompt_cache=cache)
+    """
+    try:
+        from mlx_lm.models.cache import make_prompt_cache, KVCache
+    except ImportError:
+        raise ImportError(
+            "mlx-lm is required. Install with: pip install mlx-lm"
+        )
+
+    base_cache = make_prompt_cache(model)
+
+    # Identify KV attention layers (skip non-KVCache layers like ArraysCache)
+    kv_indices = [i for i, c in enumerate(base_cache) if isinstance(c, KVCache)]
+    n_kv = len(kv_indices)
+
+    turbo_caches = []
+    for rank, idx in enumerate(kv_indices):
+        if rank < boundary or rank >= n_kv - boundary:
+            continue  # Keep boundary layers at FP16
+        tc = TurboKVCache(
+            bits=bits,
+            key_bits=key_bits,
+            min_compress_tokens=min_compress_tokens,
+            k_compress_threshold=k_compress_threshold,
+        )
+        base_cache[idx] = tc
+        turbo_caches.append(tc)
+
+    # Install monkey-patched SDPA for fused attention routing.
+    # Works with stock mlx-lm — no fork needed.
+    patch_mlx_lm(base_cache)
+
+    return base_cache
