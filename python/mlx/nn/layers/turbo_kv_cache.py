@@ -1507,12 +1507,15 @@ def turbo_asymmetric_attention(
     n_q_heads = queries.shape[1]
 
     # Handle GQA for K scoring: expand KV keys to match query heads
-    keys_for_score = fp_keys
+    # Cast to queries dtype for consistent precision (some layers store
+    # K as FP16, others as FP32 — mismatch causes small errors that
+    # compound across generation steps)
+    keys_for_score = fp_keys.astype(queries.dtype)
     if n_kv_heads < n_q_heads:
         gqa_factor = n_q_heads // n_kv_heads
-        keys_for_score = mx.repeat(fp_keys, gqa_factor, axis=1)
+        keys_for_score = mx.repeat(keys_for_score, gqa_factor, axis=1)
 
-    # Step 1: Score with FP16 K — standard matmul, already fast
+    # Step 1: Score with K — standard matmul
     scores = (queries @ keys_for_score.transpose(0, 1, 3, 2)) * scale
 
     # Step 2: Softmax
@@ -3599,6 +3602,15 @@ def patch_mlx_lm(cache_list: Optional[list] = None) -> None:
         return _original_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
     base.scaled_dot_product_attention = turbo_sdpa
+
+    # Also patch all ALREADY-LOADED model modules that imported SDPA by name.
+    # Python 'from X import Y' copies the reference — patching X.Y alone
+    # doesn't update Y in the importing module.
+    import sys as _sys
+    for _name, _mod in _sys.modules.items():
+        if _name.startswith('mlx_lm.models.') and hasattr(_mod, 'scaled_dot_product_attention'):
+            if _mod.scaled_dot_product_attention is _original_sdpa:
+                _mod.scaled_dot_product_attention = turbo_sdpa
 
     # Mark caches as patched so update_and_fetch skips decode
     if cache_list is not None:
