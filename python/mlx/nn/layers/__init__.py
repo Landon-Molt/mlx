@@ -108,6 +108,7 @@ from mlx.nn.layers.turbo_kv_cache import (
     patch_mlx_lm,
     turbo_asymmetric_attention,
     turbo_attention,
+    turbo_fused_asymmetric_attention_single_dispatch,
     turbo_decode,
     turbo_encode,
     turbo_fused_attention,
