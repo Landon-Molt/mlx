@@ -1828,7 +1828,8 @@ def turbo_fused_attention(
     kernel = _get_turbo_attn_kernel(bits, nr0=1)
     cb = _get_codebook(bits, dim)
 
-    B, n_heads, T_kv, packed_dim = packed_keys.shape
+    B, _, T_kv, packed_dim = packed_keys.shape
+    n_heads = queries.shape[1]  # Query heads (may differ from KV heads in GQA)
 
     # --- Step 1: Pre-rotate queries into WHT domain (dual signs) ---
     # Q_rot = signs2 * WHT(signs1 * Q)
@@ -1858,6 +1859,18 @@ def turbo_fused_attention(
     tg_size = min(64, max(32, T_kv))  # At least 1 SIMD group, at most 64
     # Round to SIMD group boundary
     tg_size = ((tg_size + 31) // 32) * 32
+
+    # Handle GQA: expand KV heads to match query heads if needed
+    n_kv_heads = packed_keys.shape[1]
+    if n_kv_heads < n_heads:
+        gqa_factor = n_heads // n_kv_heads
+        # Repeat each KV head gqa_factor times: [B, nkv, T, D] → [B, nq, T, D]
+        packed_keys = mx.repeat(packed_keys, gqa_factor, axis=1)
+        key_norms = mx.repeat(key_norms, gqa_factor, axis=1)
+        packed_values = mx.repeat(packed_values, gqa_factor, axis=1)
+        value_norms = mx.repeat(value_norms, gqa_factor, axis=1)
+        k_norms_flat = key_norms.squeeze(-1).astype(mx.float32) if key_norms.ndim > 3 else key_norms.astype(mx.float32)
+        v_norms_flat = value_norms.squeeze(-1).astype(mx.float32) if value_norms.ndim > 3 else value_norms.astype(mx.float32)
 
     # Reshape inputs to (B*n_heads, ...) for the kernel
     q_rot_flat = q_rot.reshape(n_bh, dim)
@@ -1937,7 +1950,8 @@ def _turbo_fused_attention_nr0_2(
     kernel = _get_turbo_attn_kernel(bits, nr0=2)
     cb = _get_codebook(bits, dim)
 
-    B, n_heads, T_kv, packed_dim = packed_keys.shape
+    B, _, T_kv, packed_dim = packed_keys.shape
+    n_heads = queries.shape[1]  # Query heads (may differ from KV heads in GQA)
 
     # Pre-rotate both queries into WHT domain (dual signs)
     signs1 = _sign_flip_vector(dim, seed)
@@ -2593,7 +2607,7 @@ class TurboKVCache:
         # would just waste memory (the whole point of patching).
         skip_decoded = (
             (self.compact_threshold > 0 and self.offset > self.compact_threshold)
-            or self._patched
+            or (self._patched and self.compress_keys and self.compress_values and self.k_bits == self.v_bits == 4)
         )
         if skip_decoded and not self._patched:
             self._compact_mode = True
