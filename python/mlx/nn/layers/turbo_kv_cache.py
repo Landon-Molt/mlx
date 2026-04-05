@@ -979,6 +979,10 @@ class TurboKVCache:
         key_bits (Optional[int]): Bit-width for keys. ``None`` = same as
             ``bits``. Set to 0 to keep keys at full precision. Default: None.
         seed (int): SRHT random seed. Default: 42.
+        min_compress_tokens (int): Minimum number of cached tokens before
+            compression kicks in. Below this threshold, KV stays in raw FP16
+            — the memory savings are <2MB but the encode/decode overhead
+            costs ~30% decode speed. Default: 256.
 
     Example:
         >>> import mlx_lm
@@ -997,10 +1001,15 @@ class TurboKVCache:
         bits: int = 4,
         key_bits: Optional[int] = None,
         seed: int = 42,
+        min_compress_tokens: int = 256,
     ):
         self.v_bits = bits
         self.k_bits = key_bits if key_bits is not None else bits
         self.seed = seed
+        # Deferred compression: below this threshold, keep KV in raw FP16.
+        # The memory savings at short context are <2MB but the speed cost of
+        # encode/decode is ~30%. Only compress when the cache exceeds this size.
+        self.min_compress_tokens = min_compress_tokens
 
         # Raw (uncompressed) storage — used during prefill
         self._raw_keys: Optional[mx.array] = None
@@ -1110,6 +1119,24 @@ class TurboKVCache:
 
         # --- Prefill phase: accumulate raw ---
         if not self._is_compressed and num_steps > 1:
+            if self._raw_keys is None:
+                self._raw_keys = keys
+                self._raw_values = values
+            else:
+                self._raw_keys = mx.concatenate(
+                    [self._raw_keys, keys], axis=2,
+                )
+                self._raw_values = mx.concatenate(
+                    [self._raw_values, values], axis=2,
+                )
+            self.offset = self._raw_keys.shape[2]
+            return self._raw_keys, self._raw_values
+
+        # --- Deferred compression: stay raw until we hit the token threshold ---
+        # Below min_compress_tokens, the memory savings are negligible (<2MB)
+        # but the encode/decode overhead costs ~30% decode speed. Keep raw FP16
+        # until the cache is big enough to justify compression.
+        if not self._is_compressed and self.offset < self.min_compress_tokens:
             if self._raw_keys is None:
                 self._raw_keys = keys
                 self._raw_values = values
@@ -1296,5 +1323,6 @@ class TurboKVCache:
         v_desc = f"v={self.v_bits}bit" if self.compress_values else "v=fp"
         return (
             f"TurboKVCache({k_desc}, {v_desc}, {mode}, "
-            f"offset={self.offset}, dim={self._dim})"
+            f"offset={self.offset}, dim={self._dim}, "
+            f"min_compress={self.min_compress_tokens})"
         )
