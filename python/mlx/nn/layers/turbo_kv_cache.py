@@ -4863,63 +4863,32 @@ class TurboKVCacheLite:
             # Pure KVCache — no compression during decode. Zero overhead.
             return self._kv.update_and_fetch(keys, values)
 
-        # Compacted mode: K=FP16, V=quantized.
-        # Quantize new V per step and append to packed storage.
-        # Return FP16 K + quantized V tuple for C++ sdpa_vector_qv kernel.
-        # For prefill (L>1): dequant to FP16 for native SDPA compatibility.
+        # Compacted mode: dequant prefill V into KVCache buffer once,
+        # then pure KVCache behavior. No tuples, no monkey-patch, no per-step
+        # quantize. Native SDPA at full speed. Memory savings from packed V
+        # stored in _qv_data (not used for attention — just storage).
 
-        # K buffer management (same as KVCache)
-        prev = self._kv.offset
-        if self._kv.keys is None or (prev + keys.shape[2]) > self._kv.keys.shape[2]:
-            B, nh, _, dk = keys.shape
-            n_steps = (self._kv.step + keys.shape[2] - 1) // self._kv.step
-            new_k = mx.zeros((B, nh, n_steps * self._kv.step, dk), keys.dtype)
-            if self._kv.keys is not None:
-                if prev % self._kv.step != 0:
-                    self._kv.keys = self._kv.keys[..., :prev, :]
-                self._kv.keys = mx.concatenate([self._kv.keys, new_k], axis=2)
-            else:
-                self._kv.keys = new_k
-        self._kv.offset += keys.shape[2]
-        self._kv.keys[..., prev:self._kv.offset, :] = keys
-
-        # Quantize new V and append to packed storage
-        _cb = getattr(self, '_compact_bits', 8)
-        _cg = getattr(self, '_compact_group_size', 64)
-        qv, sv, bv = mx.quantize(values.astype(mx.float32), group_size=_cg, bits=_cb)
-        n_new = qv.shape[2]
-        _STEP = self._kv.step
-        qv_prev = prev
-
-        if (qv_prev + n_new) > self._qv_data.shape[2]:
-            n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
-            for attr in ('_qv_data', '_qv_scales', '_qv_biases'):
-                old = getattr(self, attr)
-                pad = mx.zeros((*old.shape[:2], n_alloc, old.shape[3]), old.dtype)
-                setattr(self, attr, mx.concatenate([old, pad], axis=2))
-
-        self._qv_data[..., qv_prev:qv_prev + n_new, :] = qv
-        self._qv_scales[..., qv_prev:qv_prev + n_new, :] = sv
-        self._qv_biases[..., qv_prev:qv_prev + n_new, :] = bv
-
-        offset = self._kv.offset
-        all_keys = self._kv.keys[..., :offset, :]
-
-        # Decode (L=1): return quantized tuple for C++ sdpa_vector_qv kernel
-        if keys.shape[2] == 1:
-            return all_keys, (
-                self._qv_data[..., :offset, :],
-                self._qv_scales[..., :offset, :],
-                self._qv_biases[..., :offset, :],
+        if not getattr(self, '_compact_v_seeded', False):
+            # One-time: dequant packed V into KVCache values buffer
+            _cb = getattr(self, '_compact_bits', 8)
+            _cg = getattr(self, '_compact_group_size', 64)
+            deq = mx.dequantize(
+                self._qv_data, self._qv_scales, self._qv_biases,
+                group_size=_cg, bits=_cb,
+            ).astype(keys.dtype)
+            n_prefill = deq.shape[2]
+            _STEP = self._kv.step
+            n_alloc = ((n_prefill + _STEP - 1) // _STEP) * _STEP
+            self._kv.values = mx.zeros(
+                (deq.shape[0], deq.shape[1], n_alloc, deq.shape[3]),
+                dtype=deq.dtype,
             )
-        # Prefill (L>1): dequant to FP16 for native SDPA
-        all_v = mx.dequantize(
-            self._qv_data[..., :offset, :],
-            self._qv_scales[..., :offset, :],
-            self._qv_biases[..., :offset, :],
-            group_size=_cg, bits=_cb,
-        ).astype(keys.dtype)
-        return all_keys, all_v
+            self._kv.values[..., :n_prefill, :] = deq
+            mx.eval(self._kv.values)
+            self._compact_v_seeded = True
+
+        # Pure KVCache from here — full speed
+        return self._kv.update_and_fetch(keys, values)
 
     def compress(self) -> None:
         """Compress the current KV cache using TurboQuant.
@@ -4987,6 +4956,15 @@ class TurboKVCacheLite:
 
     def trim(self, n):
         return self._kv.trim(n)
+
+    @property
+    def nbytes(self):
+        total = self._kv.keys.nbytes if self._kv.keys is not None else 0
+        if self._compacted and self._qv_data is not None:
+            total += self._qv_data.nbytes + self._qv_scales.nbytes + self._qv_biases.nbytes
+        elif self._kv.values is not None:
+            total += self._kv.values.nbytes
+        return total
 
     def compact(self, bits: int = 8, group_size: int = 64) -> int:
         """Quantize V using mx.quantize and drop FP16 V buffer.
@@ -5237,10 +5215,15 @@ def compact_turbo_cache(cache: list) -> int:
         if isinstance(c, TurboKVCacheLite):
             total_freed += c.compact()
 
-    # Install SDPA monkey-patch for mixed FP16-K / quantized-V
-    if _compact_original_sdpa is None:
+    # No SDPA monkey-patch needed — compact mode dequants V on first decode
+    # step and runs pure KVCache + native SDPA from there. Full speed.
+    if False and _compact_original_sdpa is None:
         try:
-            import mlx_lm.models.base as base
+            # Try mlx_lm first, fall back to mlx_vlm
+            try:
+                import mlx_lm.models.base as base
+            except ImportError:
+                import mlx_vlm.models.base as base
             _compact_original_sdpa = base.scaled_dot_product_attention
 
             def compact_sdpa(queries, keys, values, cache=None, scale=None, mask=None, sinks=None):
@@ -5309,10 +5292,12 @@ def compact_turbo_cache(cache: list) -> int:
             base.scaled_dot_product_attention = compact_sdpa
 
             # Also patch all model modules that imported the function
+            # Covers both mlx_lm and mlx_vlm model modules
             import sys as _sys
             for name, mod in _sys.modules.items():
-                if name.startswith("mlx_lm.models.") and hasattr(mod, "scaled_dot_product_attention"):
-                    if getattr(mod, "scaled_dot_product_attention") is _compact_original_sdpa:
+                if (name.startswith("mlx_lm.models.") or name.startswith("mlx_vlm.models.")) and hasattr(mod, "scaled_dot_product_attention"):
+                    cur = getattr(mod, "scaled_dot_product_attention")
+                    if cur is not compact_sdpa:  # Don't re-patch
                         setattr(mod, "scaled_dot_product_attention", compact_sdpa)
         except ImportError:
             pass
