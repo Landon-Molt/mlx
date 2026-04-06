@@ -3,6 +3,7 @@
 // clang-format off
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
+#include "mlx/backend/metal/kernels/sdpa_vector_qv.h"
 
 using namespace metal;
 
@@ -41,4 +42,21 @@ using namespace metal;
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+// Quantized-V SDPA vector instantiations (K=FP16, V=4-bit packed)
+#define instantiate_sdpa_vector_qv(type, dim)     \
+  instantiate_kernel(                              \
+      "sdpa_vector_qv_" #type "_" #dim,            \
+      sdpa_vector_qv,                              \
+      type,                                        \
+      dim)
+
+#define instantiate_sdpa_vector_qv_heads(type)  \
+  instantiate_sdpa_vector_qv(type, 64)          \
+  instantiate_sdpa_vector_qv(type, 96)          \
+  instantiate_sdpa_vector_qv(type, 128)         \
+  instantiate_sdpa_vector_qv(type, 256)
+
+instantiate_sdpa_vector_qv_heads(float16_t)
+instantiate_sdpa_vector_qv_heads(bfloat16_t)
     // clang-format on
