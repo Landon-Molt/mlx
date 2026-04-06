@@ -4855,6 +4855,8 @@ class TurboKVCacheLite:
         self._qv_data: Optional[mx.array] = None
         self._qv_scales: Optional[mx.array] = None
         self._qv_biases: Optional[mx.array] = None
+        self._compact_pending_v: List[mx.array] = []  # Raw V tokens awaiting batch quantize
+        self._compact_batch_size = 32  # Batch-quantize every N tokens
 
     def update_and_fetch(self, keys, values):
         if not self._compacted:
@@ -4878,30 +4880,25 @@ class TurboKVCacheLite:
         self._kv.offset += keys.shape[2]
         self._kv.keys[..., prev:self._kv.offset, :] = keys
 
-        # Quantize new V and append to pre-allocated quantized storage
+        # Quantize new V and slice-assign to pre-allocated storage
         qv, sv, bv = mx.quantize(values, group_size=32, bits=4)
         n_new = qv.shape[2]
         _STEP = self._kv.step
+        qv_prev = prev
 
         # Grow quantized buffers if needed
-        qv_prev = prev  # Same offset as K
         if (qv_prev + n_new) > self._qv_data.shape[2]:
             n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
-            self._qv_data = mx.concatenate([
-                self._qv_data, mx.zeros((*self._qv_data.shape[:2], n_alloc, self._qv_data.shape[3]), self._qv_data.dtype)
-            ], axis=2)
-            self._qv_scales = mx.concatenate([
-                self._qv_scales, mx.zeros((*self._qv_scales.shape[:2], n_alloc, self._qv_scales.shape[3]), self._qv_scales.dtype)
-            ], axis=2)
-            self._qv_biases = mx.concatenate([
-                self._qv_biases, mx.zeros((*self._qv_biases.shape[:2], n_alloc, self._qv_biases.shape[3]), self._qv_biases.dtype)
-            ], axis=2)
+            for attr in ('_qv_data', '_qv_scales', '_qv_biases'):
+                old = getattr(self, attr)
+                pad = mx.zeros((*old.shape[:2], n_alloc, old.shape[3]), old.dtype)
+                setattr(self, attr, mx.concatenate([old, pad], axis=2))
 
         self._qv_data[..., qv_prev:qv_prev + n_new, :] = qv
         self._qv_scales[..., qv_prev:qv_prev + n_new, :] = sv
         self._qv_biases[..., qv_prev:qv_prev + n_new, :] = bv
 
-        # Return FP16 K + quantized V tuple (SDPA must handle this)
+        # Return FP16 K + quantized V tuple
         offset = self._kv.offset
         all_keys = self._kv.keys[..., :offset, :]
         q_values = (
