@@ -4886,7 +4886,7 @@ class TurboKVCacheLite:
         # Quantize new V and append to packed storage
         _cb = getattr(self, '_compact_bits', 8)
         _cg = getattr(self, '_compact_group_size', 64)
-        qv, sv, bv = mx.quantize(values, group_size=_cg, bits=_cb)
+        qv, sv, bv = mx.quantize(values.astype(mx.float32), group_size=_cg, bits=_cb)
         n_new = qv.shape[2]
         _STEP = self._kv.step
         qv_prev = prev
@@ -5014,8 +5014,9 @@ class TurboKVCacheLite:
         self._compact_bits = bits
         self._compact_group_size = group_size
 
-        # Quantize V
-        v = self._kv.values[..., :offset, :]
+        # Quantize V (cast to float32 so scales/biases are float32 —
+        # required by the C++ sdpa_vector_qv kernel which reads float*)
+        v = self._kv.values[..., :offset, :].astype(mx.float32)
         self._qv_data, self._qv_scales, self._qv_biases = mx.quantize(
             v, group_size=group_size, bits=bits
         )
@@ -5250,10 +5251,23 @@ def compact_turbo_cache(cache: list) -> int:
                     if scale is None:
                         scale = D ** -0.5
 
-                    # NOTE: C++ sdpa_vector_qv kernel disabled — precision compounds
-                    # across layers during multi-step decode. mx.quantized_matmul is stable.
-                    # The kernel works in isolation but produces garbage after ~50 decode
-                    # steps on 24-layer dense models. Root cause under investigation.
+                    # C++ sdpa_vector_qv kernel — single dispatch.
+                    # Bug fix: scales/biases must be float32 (kernel reads float*).
+                    _cg = 64
+                    if isinstance(cache, TurboKVCacheLite):
+                        _cg = getattr(cache, '_compact_group_size', 64)
+                    if L == 1 and D in (64, 96, 128, 256) and mx.metal.is_available():
+                        try:
+                            qv_data, qv_scales, qv_biases = values
+                            return mx.fast.scaled_dot_product_attention_qv(
+                                queries, keys,
+                                qv_data,
+                                qv_scales.astype(mx.float32),
+                                qv_biases.astype(mx.float32),
+                                scale=scale, group_size=_cg,
+                            )
+                        except Exception:
+                            pass
 
                     # Fallback: manual Q×K + mx.quantized_matmul
                     n_repeats = n_q_heads // n_kv_heads
