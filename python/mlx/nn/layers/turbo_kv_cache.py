@@ -4869,22 +4869,48 @@ class TurboKVCacheLite:
         # stored in _qv_data (not used for attention — just storage).
 
         if not getattr(self, '_compact_v_seeded', False):
-            # One-time: dequant packed V into KVCache values buffer
-            _cb = getattr(self, '_compact_bits', 8)
-            _cg = getattr(self, '_compact_group_size', 64)
-            deq = mx.dequantize(
-                self._qv_data, self._qv_scales, self._qv_biases,
-                group_size=_cg, bits=_cb,
-            ).astype(keys.dtype)
-            n_prefill = deq.shape[2]
+            _cb = getattr(self, '_compact_bits', 4)
             _STEP = self._kv.step
+
+            if getattr(self, '_compact_use_turbo', False):
+                # TurboQuant decode K+V (SRHT + Lloyd-Max)
+                dim = self._turbo_packed_v.shape[-1] * 8  # 4-bit: 8 per uint32
+                deq_v = turbo_decode(
+                    self._turbo_packed_v, self._turbo_v_norms, dim,
+                    bits=_cb, seed=self._seed,
+                ).astype(keys.dtype)
+                deq_k = turbo_decode(
+                    self._turbo_packed_k, self._turbo_k_norms, dim,
+                    bits=_cb, seed=self._seed,
+                ).astype(keys.dtype)
+            else:
+                _cg = getattr(self, '_compact_group_size', 64)
+                deq_v = mx.dequantize(
+                    self._qv_data, self._qv_scales, self._qv_biases,
+                    group_size=_cg, bits=_cb,
+                ).astype(keys.dtype)
+                deq_k = None
+
+            n_prefill = deq_v.shape[2]
             n_alloc = ((n_prefill + _STEP - 1) // _STEP) * _STEP
+
+            # Seed V buffer
             self._kv.values = mx.zeros(
-                (deq.shape[0], deq.shape[1], n_alloc, deq.shape[3]),
-                dtype=deq.dtype,
+                (deq_v.shape[0], deq_v.shape[1], n_alloc, deq_v.shape[3]),
+                dtype=deq_v.dtype,
             )
-            self._kv.values[..., :n_prefill, :] = deq
-            mx.eval(self._kv.values)
+            self._kv.values[..., :n_prefill, :] = deq_v
+
+            # Seed K buffer (if K was compressed)
+            if deq_k is not None:
+                self._kv.keys = mx.zeros(
+                    (deq_k.shape[0], deq_k.shape[1], n_alloc, deq_k.shape[3]),
+                    dtype=deq_k.dtype,
+                )
+                self._kv.keys[..., :n_prefill, :] = deq_k
+                self._kv.offset = n_prefill
+
+            mx.eval(self._kv.values, self._kv.keys)
             self._compact_v_seeded = True
 
         # Pure KVCache from here — full speed
@@ -4959,6 +4985,13 @@ class TurboKVCacheLite:
 
     @property
     def nbytes(self):
+        if self._compacted and getattr(self, '_compact_use_turbo', False):
+            total = 0
+            if hasattr(self, '_turbo_packed_v') and self._turbo_packed_v is not None:
+                total += self._turbo_packed_v.nbytes + self._turbo_v_norms.nbytes
+            if hasattr(self, '_turbo_packed_k') and self._turbo_packed_k is not None:
+                total += self._turbo_packed_k.nbytes + self._turbo_k_norms.nbytes
+            return total
         total = self._kv.keys.nbytes if self._kv.keys is not None else 0
         if self._compacted and self._qv_data is not None:
             total += self._qv_data.nbytes + self._qv_scales.nbytes + self._qv_biases.nbytes
@@ -4992,20 +5025,29 @@ class TurboKVCacheLite:
         self._compact_bits = bits
         self._compact_group_size = group_size
 
-        # Quantize V (cast to float32 so scales/biases are float32 —
-        # required by the C++ sdpa_vector_qv kernel which reads float*)
-        v = self._kv.values[..., :offset, :].astype(mx.float32)
-        self._qv_data, self._qv_scales, self._qv_biases = mx.quantize(
-            v, group_size=group_size, bits=bits
+        # Use TurboQuant (SRHT + Lloyd-Max) for K+V compression.
+        v = self._kv.values[..., :offset, :]
+        self._turbo_packed_v, self._turbo_v_norms = turbo_encode(
+            v, bits=bits, seed=self._seed,
         )
-        mx.eval(self._qv_data, self._qv_scales, self._qv_biases)
+        # Also compress K
+        k = self._kv.keys[..., :offset, :]
+        self._turbo_packed_k, self._turbo_k_norms = turbo_encode(
+            k, bits=bits, seed=self._seed,
+        )
+        mx.eval(self._turbo_packed_v, self._turbo_v_norms,
+                self._turbo_packed_k, self._turbo_k_norms)
+        self._compact_use_turbo = True
 
-        # Drop FP16 V buffer
+        # Drop FP16 K+V buffers
+        old_k_bytes = self._kv.keys.nbytes
         self._kv.values = None
+        self._kv.keys = None
         self._compacted = True
 
-        new_bytes = self._qv_data.nbytes + self._qv_scales.nbytes + self._qv_biases.nbytes
-        return old_bytes - new_bytes
+        new_bytes = (self._turbo_packed_v.nbytes + self._turbo_v_norms.nbytes +
+                     self._turbo_packed_k.nbytes + self._turbo_k_norms.nbytes)
+        return (old_bytes + old_k_bytes) - new_bytes
 
     @property
     def _is_compacted(self):
