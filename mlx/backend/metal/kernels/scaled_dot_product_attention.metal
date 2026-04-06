@@ -59,4 +59,21 @@ instantiate_sdpa_vector_heads(float16_t)
 
 instantiate_sdpa_vector_qv_heads(float16_t)
 instantiate_sdpa_vector_qv_heads(bfloat16_t)
+
+// 8-bit quantized-V SDPA vector instantiations
+#define instantiate_sdpa_vector_qv8(type, dim)     \
+  instantiate_kernel(                               \
+      "sdpa_vector_qv8_" #type "_" #dim,            \
+      sdpa_vector_qv8,                              \
+      type,                                         \
+      dim)
+
+#define instantiate_sdpa_vector_qv8_heads(type)  \
+  instantiate_sdpa_vector_qv8(type, 64)          \
+  instantiate_sdpa_vector_qv8(type, 96)          \
+  instantiate_sdpa_vector_qv8(type, 128)         \
+  instantiate_sdpa_vector_qv8(type, 256)
+
+instantiate_sdpa_vector_qv8_heads(float16_t)
+instantiate_sdpa_vector_qv8_heads(bfloat16_t)
     // clang-format on
