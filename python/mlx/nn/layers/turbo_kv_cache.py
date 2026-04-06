@@ -4881,7 +4881,9 @@ class TurboKVCacheLite:
         self._kv.keys[..., prev:self._kv.offset, :] = keys
 
         # Quantize new V and slice-assign to pre-allocated storage
-        qv, sv, bv = mx.quantize(values, group_size=32, bits=4)
+        _cb = getattr(self, '_compact_bits', 8)
+        _cg = getattr(self, '_compact_group_size', 64)
+        qv, sv, bv = mx.quantize(values, group_size=_cg, bits=_cb)
         n_new = qv.shape[2]
         _STEP = self._kv.step
         qv_prev = prev
@@ -4898,15 +4900,30 @@ class TurboKVCacheLite:
         self._qv_scales[..., qv_prev:qv_prev + n_new, :] = sv
         self._qv_biases[..., qv_prev:qv_prev + n_new, :] = bv
 
-        # Return FP16 K + quantized V tuple
+        # Return FP16 K + V
         offset = self._kv.offset
         all_keys = self._kv.keys[..., :offset, :]
-        q_values = (
-            self._qv_data[..., :offset, :],
-            self._qv_scales[..., :offset, :],
-            self._qv_biases[..., :offset, :],
-        )
-        return all_keys, q_values
+
+        # For decode (L=1): return quantized V tuple for fast C++ kernel
+        # For prefill (L>1): dequantize V to FP16 for native SDPA compatibility
+        if keys.shape[2] == 1:
+            q_values = (
+                self._qv_data[..., :offset, :],
+                self._qv_scales[..., :offset, :],
+                self._qv_biases[..., :offset, :],
+            )
+            return all_keys, q_values
+        else:
+            # Prefill after compact — dequantize for native SDPA
+            _cb = getattr(self, '_compact_bits', 8)
+            _cg = getattr(self, '_compact_group_size', 64)
+            all_v = mx.dequantize(
+                self._qv_data[..., :offset, :],
+                self._qv_scales[..., :offset, :],
+                self._qv_biases[..., :offset, :],
+                group_size=_cg, bits=_cb,
+            ).astype(keys.dtype)
+            return all_keys, all_v
 
     def compress(self) -> None:
         """Compress the current KV cache using TurboQuant.
@@ -4975,15 +4992,17 @@ class TurboKVCacheLite:
     def trim(self, n):
         return self._kv.trim(n)
 
-    def compact(self) -> int:
-        """Quantize V to 4-bit using mx.quantize and drop FP16 V buffer.
+    def compact(self, bits: int = 8, group_size: int = 64) -> int:
+        """Quantize V using mx.quantize and drop FP16 V buffer.
 
-        K stays FP16 (critical for quality). V is quantized to 4-bit with
-        group_size=32 using MLX's built-in quantization. The quantized V
-        is stored as (data, scales, biases) tuple.
+        K stays FP16 (critical for quality). V is quantized to the specified
+        bit-width using MLX's built-in quantization.
 
-        After compacting, update_and_fetch returns FP16 K and quantized V.
-        The SDPA must handle mixed K/V formats. Use with patch_compact_sdpa().
+        Args:
+            bits: Quantization bit-width (4 or 8). Default 8 (safe for dense
+                models with 24+ layers). 4-bit causes quality collapse on
+                dense models due to error compounding across layers.
+            group_size: Quantization group size. Default 64.
 
         Returns:
             Approximate bytes freed.
@@ -4996,11 +5015,13 @@ class TurboKVCacheLite:
             return 0
 
         old_bytes = self._kv.values.nbytes
+        self._compact_bits = bits
+        self._compact_group_size = group_size
 
-        # Quantize V to 4-bit
+        # Quantize V
         v = self._kv.values[..., :offset, :]
         self._qv_data, self._qv_scales, self._qv_biases = mx.quantize(
-            v, group_size=32, bits=4
+            v, group_size=group_size, bits=bits
         )
         mx.eval(self._qv_data, self._qv_scales, self._qv_biases)
 
@@ -5228,15 +5249,25 @@ def compact_turbo_cache(cache: list) -> int:
             def compact_sdpa(queries, keys, values, cache=None, scale=None, mask=None, sinks=None):
                 # Detect compacted TurboKVCacheLite — values is a quantized tuple
                 if isinstance(values, tuple) and len(values) == 3:
-                    # FP16 K scoring + quantized V weighted sum
                     B, n_q_heads, L, D = queries.shape
                     n_kv_heads = keys.shape[1]
-                    n_repeats = n_q_heads // n_kv_heads
-
                     if scale is None:
                         scale = D ** -0.5
-                    q_scaled = queries * scale
 
+                    # Try C++ sdpa_vector_qv kernel first (single dispatch, fastest)
+                    if L == 1 and D in (64, 96, 128, 256):
+                        try:
+                            qv_data, qv_scales, qv_biases = values
+                            return mx.fast.scaled_dot_product_attention_qv(
+                                queries, keys, qv_data, qv_scales, qv_biases,
+                                scale=scale, group_size=32,
+                            )
+                        except Exception:
+                            pass  # Fall through to quantized_matmul
+
+                    # Fallback: manual Q×K + mx.quantized_matmul
+                    n_repeats = n_q_heads // n_kv_heads
+                    q_scaled = queries * scale
                     if n_repeats > 1:
                         q_scaled = q_scaled.reshape(B, n_kv_heads, n_repeats, L, D)
                         k_exp = mx.expand_dims(keys, axis=2)
@@ -5244,12 +5275,9 @@ def compact_turbo_cache(cache: list) -> int:
                     else:
                         k_exp = keys
                         qv = values
-
-                    # Q×K scoring on FP16 K (standard matmul)
                     scores = q_scaled @ k_exp.transpose(0, 1, 2, -1, -2) if n_repeats > 1 else (
                         q_scaled @ keys.transpose(0, 1, 3, 2)
                     )
-
                     if mask is not None:
                         if isinstance(mask, str):
                             qL, kL = scores.shape[-2:]
@@ -5260,14 +5288,13 @@ def compact_turbo_cache(cache: list) -> int:
                             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
                         else:
                             scores += mask
-
                     weights = mx.softmax(scores, axis=-1, precise=True)
-
-                    # W×V using quantized_matmul (C++ kernel)
-                    out = mx.quantized_matmul(
-                        weights, *qv, transpose=False, group_size=32, bits=4
-                    )
-
+                    # Detect bits/group_size from cache if available
+                    _cb = 8; _cg = 64
+                    if isinstance(cache, TurboKVCacheLite):
+                        _cb = getattr(cache, '_compact_bits', 8)
+                        _cg = getattr(cache, '_compact_group_size', 64)
+                    out = mx.quantized_matmul(weights, *qv, transpose=False, group_size=_cg, bits=_cb)
                     if n_repeats > 1:
                         out = out.reshape(B, n_q_heads, L, D)
                     return out
