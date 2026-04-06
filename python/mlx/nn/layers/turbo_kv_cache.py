@@ -4867,6 +4867,8 @@ class TurboKVCacheLite:
             return
 
         offset = self._kv.offset
+        if offset == 0:
+            return
 
         # Compress V
         v = self._kv.values[..., :offset, :]
@@ -4918,18 +4920,22 @@ class TurboKVCacheLite:
         return self._kv.trim(n)
 
     def recover_memory(self) -> int:
-        """Compress and drop FP16 KV to free memory.
+        """Replace FP16 KV with lossy re-decoded version and drop compressed storage.
 
-        Compresses K/V if not already compressed, then replaces the FP16
-        values buffer with the lossy decoded version from compressed storage.
-        The FP16 keys buffer is similarly replaced if K was compressed.
+        Compresses K/V if not already compressed, decodes back to FP16 (lossy),
+        replaces the KV buffers, and drops the compressed copies. The FP16
+        buffers shrink by dropping pre-allocation padding.
 
-        This trades decode quality (~+0.04% PPL from quantization noise) for
-        ~74% KV memory savings. Attention continues on FP16 (re-decoded from
-        compressed) so native SDPA still works.
+        Note: this does NOT achieve 74% memory savings — it replaces FP16 with
+        lossy FP16 of the same size. The savings come only from dropping the
+        pre-allocation padding (~10-20%). For true compressed-only storage,
+        a fused attention kernel that operates on packed data is needed.
+
+        Attention continues on FP16 (re-decoded) so native SDPA still works.
+        Not thread-safe — call only when no concurrent decode is running.
 
         Returns:
-            Approximate bytes freed.
+            Approximate bytes freed (from dropping pre-allocation padding).
         """
         if self._kv.keys is None:
             return 0
@@ -4964,8 +4970,9 @@ class TurboKVCacheLite:
         # Replace FP16 K with decoded-from-compressed if K was compressed
         if self._packed_keys is not None:
             n_compressed_k = self._packed_keys.shape[2]
+            k_dim = self._kv.keys.shape[-1]  # K dim may differ from V dim
             decoded_k = turbo_decode(
-                self._packed_keys, self._key_norms, dim,
+                self._packed_keys, self._key_norms, k_dim,
                 bits=self._key_bits, seed=self._seed,
             )
             if offset > n_compressed_k:
