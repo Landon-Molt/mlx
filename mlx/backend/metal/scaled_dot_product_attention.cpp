@@ -868,10 +868,14 @@ void ScaledDotProductAttentionQV::eval_gpu(
 
   int D = q.shape(-1);
 
-  // Build kernel name: "sdpa_vector_qv_{type}_{D}"
+  // Build kernel name: "sdpa_vector_qv[8]_{type}_{D}"
   std::string kname;
   kname.reserve(64);
-  kname += "sdpa_vector_qv_";
+  if (group_size_ == 64) {
+    kname += "sdpa_vector_qv8_";
+  } else {
+    kname += "sdpa_vector_qv_";
+  }
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(D);

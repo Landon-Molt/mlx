@@ -986,15 +986,21 @@ array scaled_dot_product_attention_qv(
     throw std::invalid_argument(msg.str());
   }
 
-  // Validate qv_data shape: [B, n_kv, N, D/8]
+  // Validate qv_data shape: [B, n_kv, N, D/el_per_int]
+  // 4-bit: 8 elements per uint32 → D/8
+  // 8-bit: 4 elements per uint32 → D/4
+  int el_per_int = 32 / group_size == 2 ? 4 : 8;  // group_size=64 → 8-bit, group_size=32 → 4-bit
+  if (group_size == 64) el_per_int = 4;  // 8-bit: 4 per uint32
+  else el_per_int = 8;                   // 4-bit: 8 per uint32
+  int expected_packed_dim = D / el_per_int;
   int N = keys.shape(2);
   if (qv_data.shape(0) != queries.shape(0) ||
       qv_data.shape(1) != n_kv_heads || qv_data.shape(2) != N ||
-      qv_data.shape(3) != D / 8) {
+      qv_data.shape(3) != expected_packed_dim) {
     std::ostringstream msg;
     msg << "[scaled_dot_product_attention_qv] qv_data shape " << qv_data.shape()
         << " expected [" << queries.shape(0) << ", " << n_kv_heads << ", " << N
-        << ", " << D / 8 << "]";
+        << ", " << expected_packed_dim << "]";
     throw std::invalid_argument(msg.str());
   }
 
