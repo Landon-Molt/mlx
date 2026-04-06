@@ -4999,7 +4999,7 @@ class TurboKVCacheLite:
             total += self._kv.values.nbytes
         return total
 
-    def compact(self, bits: int = 8, group_size: int = 64) -> int:
+    def compact(self, bits: int = 4, group_size: int = 64) -> int:
         """Quantize V using mx.quantize and drop FP16 V buffer.
 
         K stays FP16 (critical for quality). V is quantized to the specified
