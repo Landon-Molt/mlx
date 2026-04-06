@@ -4878,15 +4878,37 @@ class TurboKVCacheLite:
         self._kv.offset += keys.shape[2]
         self._kv.keys[..., prev:self._kv.offset, :] = keys
 
-        # Quantize new V and append to quantized storage
+        # Quantize new V and append to pre-allocated quantized storage
         qv, sv, bv = mx.quantize(values, group_size=32, bits=4)
-        self._qv_data = mx.concatenate([self._qv_data, qv], axis=2)
-        self._qv_scales = mx.concatenate([self._qv_scales, sv], axis=2)
-        self._qv_biases = mx.concatenate([self._qv_biases, bv], axis=2)
+        n_new = qv.shape[2]
+        _STEP = self._kv.step
+
+        # Grow quantized buffers if needed
+        qv_prev = prev  # Same offset as K
+        if (qv_prev + n_new) > self._qv_data.shape[2]:
+            n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
+            self._qv_data = mx.concatenate([
+                self._qv_data, mx.zeros((*self._qv_data.shape[:2], n_alloc, self._qv_data.shape[3]), self._qv_data.dtype)
+            ], axis=2)
+            self._qv_scales = mx.concatenate([
+                self._qv_scales, mx.zeros((*self._qv_scales.shape[:2], n_alloc, self._qv_scales.shape[3]), self._qv_scales.dtype)
+            ], axis=2)
+            self._qv_biases = mx.concatenate([
+                self._qv_biases, mx.zeros((*self._qv_biases.shape[:2], n_alloc, self._qv_biases.shape[3]), self._qv_biases.dtype)
+            ], axis=2)
+
+        self._qv_data[..., qv_prev:qv_prev + n_new, :] = qv
+        self._qv_scales[..., qv_prev:qv_prev + n_new, :] = sv
+        self._qv_biases[..., qv_prev:qv_prev + n_new, :] = bv
 
         # Return FP16 K + quantized V tuple (SDPA must handle this)
-        all_keys = self._kv.keys[..., :self._kv.offset, :]
-        q_values = (self._qv_data, self._qv_scales, self._qv_biases)
+        offset = self._kv.offset
+        all_keys = self._kv.keys[..., :offset, :]
+        q_values = (
+            self._qv_data[..., :offset, :],
+            self._qv_scales[..., :offset, :],
+            self._qv_biases[..., :offset, :],
+        )
         return all_keys, q_values
 
     def compress(self) -> None:
