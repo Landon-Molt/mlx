@@ -297,6 +297,40 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_qv",
+      &mx::fast::scaled_dot_product_attention_qv,
+      "q"_a,
+      "k"_a,
+      "qv_data"_a,
+      "qv_scales"_a,
+      "qv_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a = 32,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_qv(q: array, k: array, qv_data: array, qv_scales: array, qv_biases: array, *, scale: float, group_size: int = 32, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Quantized-V variant of scaled dot product attention for decode (L=1).
+
+        Computes ``O = softmax(Q @ K.T) @ dequant(V)`` where K is FP16 and V is
+        stored as 4-bit packed uint32 with per-group scales and biases matching
+        ``mx.quantize(group_size=32, bits=4)`` format.
+
+        Args:
+            q (array): Queries with shape ``[B, N_q, 1, D]`` (FP16/BF16).
+            k (array): Keys with shape ``[B, N_kv, T_kv, D]`` (FP16/BF16).
+            qv_data (array): Packed 4-bit V data, shape ``[B, N_kv, T_kv, D/8]`` (uint32).
+            qv_scales (array): Per-group V scales, shape ``[B, N_kv, T_kv, D/group_size]`` (float32).
+            qv_biases (array): Per-group V biases, shape ``[B, N_kv, T_kv, D/group_size]`` (float32).
+            scale (float): Scale for queries (typically ``1.0 / sqrt(D)``).
+            group_size (int): Quantization group size. Default: ``32``.
+
+        Returns:
+            array: The output array with shape ``[B, N_q, 1, D]``.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

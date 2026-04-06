@@ -922,6 +922,168 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_;
 }
 
+/** Computes: O = softmax(Q @ K.T) @ dequant(V)
+ *  Quantized-V variant for decode (L=1). */
+array scaled_dot_product_attention_qv(
+    const array& queries,
+    const array& keys,
+    const array& qv_data,
+    const array& qv_scales,
+    const array& qv_biases,
+    const float scale,
+    int group_size /* = 32 */,
+    StreamOrDevice s /* = {} */) {
+  // Validate ranks
+  if (queries.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] queries with shape "
+        << queries.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] keys with shape "
+        << keys.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (qv_data.ndim() != 4 || qv_scales.ndim() != 4 ||
+      qv_biases.ndim() != 4) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] qv_data, qv_scales, qv_biases "
+        "expected to be rank 4");
+  }
+
+  // Decode only: L must be 1
+  if (queries.shape(2) != 1) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] only L=1 (decode) supported, "
+        << "got L=" << queries.shape(2);
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Batch dims must match
+  if (queries.shape(0) != keys.shape(0)) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] batch dimension mismatch "
+        "between queries and keys");
+  }
+
+  // Q, K must have matching last dim (head_dim)
+  int D = queries.shape(-1);
+  if (D != keys.shape(-1)) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] queries and keys must have "
+        "matching head_dim");
+  }
+
+  // GQA: n_q_heads must be a multiple of n_kv_heads
+  auto n_q_heads = queries.shape(1);
+  auto n_kv_heads = keys.shape(1);
+  if (n_q_heads % n_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] n_q_heads (" << n_q_heads
+        << ") must be a multiple of n_kv_heads (" << n_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Validate qv_data shape: [B, n_kv, N, D/8]
+  int N = keys.shape(2);
+  if (qv_data.shape(0) != queries.shape(0) ||
+      qv_data.shape(1) != n_kv_heads || qv_data.shape(2) != N ||
+      qv_data.shape(3) != D / 8) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] qv_data shape " << qv_data.shape()
+        << " expected [" << queries.shape(0) << ", " << n_kv_heads << ", " << N
+        << ", " << D / 8 << "]";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Validate qv_scales/biases shape: [B, n_kv, N, D/group_size]
+  int n_groups = D / group_size;
+  for (const auto& [name, arr] :
+       {std::pair{"qv_scales", std::cref(qv_scales)},
+        std::pair{"qv_biases", std::cref(qv_biases)}}) {
+    if (arr.get().shape(0) != queries.shape(0) ||
+        arr.get().shape(1) != n_kv_heads || arr.get().shape(2) != N ||
+        arr.get().shape(3) != n_groups) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention_qv] " << name << " shape "
+          << arr.get().shape() << " expected [" << queries.shape(0) << ", "
+          << n_kv_heads << ", " << N << ", " << n_groups << "]";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  // Supported head dims
+  if (D != 64 && D != 96 && D != 128 && D != 256) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] unsupported head_dim " << D
+        << ". Must be 64, 96, 128 or 256.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, keys);
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] Received unsupported type "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto q = astype(queries, final_type, s);
+  auto k = astype(keys, final_type, s);
+
+  // Fallback: dequantize V via mx.dequantize and use regular SDPA
+  // TODO: implement a proper CPU fallback with inline dequant
+  auto fallback =
+      [scale, n_q_heads, n_kv_heads, group_size, D, s](
+          const std::vector<array>& inputs) -> std::vector<array> {
+        auto q_in = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+        auto k_in = inputs[1];
+
+        // Use mlx dequantize: V = dequantize(qv_data, qv_scales, qv_biases)
+        auto v = dequantize(
+            inputs[2], inputs[3], inputs[4], group_size, 4, "affine",
+            std::optional<array>{}, std::optional<Dtype>{}, s);
+        v = astype(v, inputs[0].dtype(), s);
+
+        int n_repeats = n_q_heads / n_kv_heads;
+        if (n_repeats > 1) {
+          q_in = unflatten(q_in, 1, {n_kv_heads, n_repeats}, s);
+          k_in = expand_dims(k_in, 2, s);
+          v = expand_dims(v, 2, s);
+        }
+        auto scores = matmul(q_in, swapaxes(k_in, -1, -2, s), s);
+        scores = softmax(scores, std::vector<int>{-1}, true, s);
+        auto out = matmul(scores, v, s);
+        if (n_repeats > 1) {
+          out = flatten(out, 1, 2, s);
+        }
+        return std::vector<array>{out};
+      };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {q, k, qv_data, qv_scales, qv_biases};
+
+  // Only GPU path supported, and only for L=1 decode
+  if (stream.device == Device::cpu) {
+    return fallback(std::move(inputs))[0];
+  }
+
+  Shape out_shape{q.shape(0), q.shape(1), q.shape(2), D};
+  auto primitive = std::make_shared<ScaledDotProductAttentionQV>(
+      stream, fallback, scale, group_size);
+  return array(
+      std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
+bool ScaledDotProductAttentionQV::is_equivalent(
+    const Primitive& other) const {
+  const ScaledDotProductAttentionQV& a_other =
+      static_cast<const ScaledDotProductAttentionQV&>(other);
+  return scale_ == a_other.scale_ && group_size_ == a_other.group_size_;
+}
+
 bool Quantize::is_equivalent(const Primitive& other) const {
   const Quantize& p_other = static_cast<const Quantize&>(other);
   return (

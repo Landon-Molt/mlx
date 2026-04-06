@@ -54,6 +54,19 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+/** Computes: O = softmax(Q @ K.T) @ dequant(V)
+ *  Quantized-V variant: K is FP16, V is 4-bit packed uint32.
+ *  Decode-only (L=1). */
+MLX_API array scaled_dot_product_attention_qv(
+    const array& queries,
+    const array& keys,
+    const array& qv_data,
+    const array& qv_scales,
+    const array& qv_biases,
+    const float scale,
+    int group_size = 32,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

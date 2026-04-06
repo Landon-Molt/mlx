@@ -795,4 +795,149 @@ void ScaledDotProductAttentionVJP::eval_gpu(
   throw std::runtime_error("NYI");
 }
 
+void ScaledDotProductAttentionQV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_pre = inputs[1];
+  auto& qv_data_pre = inputs[2];
+  auto& qv_scales_pre = inputs[3];
+  auto& qv_biases_pre = inputs[4];
+  auto& o = outputs[0];
+
+  std::vector<array> copies;
+  copies.reserve(5);
+
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    } else {
+      return arr;
+    }
+  };
+
+  // Q can be transposed (batch/head swap) — same logic as sdpa_vector
+  auto q_copy_unless = [](const array& arr) {
+    if (arr.flags().row_contiguous) {
+      return true;
+    }
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    if (shape[0] == 1 || shape[1] == 1) {
+      auto bidx = shape[0] == 1 ? 1 : 0;
+      return (strides[3] == 1) && (strides[2] == shape[3] * shape[bidx]) &&
+          (strides[bidx] == shape[3]);
+    }
+    return false;
+  };
+
+  auto kv_copy_unless = [](const array& arr) {
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    if (strides.back() != 1) {
+      return false;
+    }
+    if (shape[0] == 1 || shape[1] == 1) {
+      return true;
+    }
+    return (strides[0] == strides[1] * shape[1]);
+  };
+
+  bool q_copied = !q_copy_unless(q_pre);
+  array q = q_copied ? contiguous_copy_gpu(q_pre, s) : q_pre;
+  const auto& k = copy_unless(kv_copy_unless, k_pre);
+  const auto& qv_data = copy_unless(kv_copy_unless, qv_data_pre);
+  const auto& qv_scales = copy_unless(kv_copy_unless, qv_scales_pre);
+  const auto& qv_biases = copy_unless(kv_copy_unless, qv_biases_pre);
+
+  // Donate the query if possible
+  if (q.is_donatable() && q.flags().row_contiguous && q.size() == o.size()) {
+    o.copy_shared_buffer(q);
+  } else {
+    if (q_copied) {
+      copies.push_back(q);
+    }
+    o.set_data(allocator::malloc(o.nbytes()));
+  }
+
+  int D = q.shape(-1);
+
+  // Build kernel name: "sdpa_vector_qv_{type}_{D}"
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_qv_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(D);
+
+  // Compute strides and sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+
+  // V data strides (in uint32 words)
+  size_t qv_data_head_stride =
+      qv_data.shape(1) == 1 ? qv_data.strides(0) : qv_data.strides(1);
+  size_t qv_data_seq_stride = qv_data.strides()[2];
+
+  // V scales/biases strides (in floats)
+  size_t qv_group_head_stride =
+      qv_scales.shape(1) == 1 ? qv_scales.strides(0) : qv_scales.strides(1);
+  size_t qv_group_seq_stride = qv_scales.strides()[2];
+
+  // Function constants — reuse the same IDs as sdpa_vector
+  bool has_mask = false;
+  bool query_transposed = !q.flags().row_contiguous;
+  bool do_causal = false;
+  bool bool_mask = false;
+  bool float_mask = false;
+  bool has_sinks = false;
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
+      {&has_sinks, MTL::DataType::DataTypeBool, 25},
+  };
+  std::string hash_name = kname;
+  hash_name += query_transposed ? "_qt" : "_qnt";
+
+  // Get the kernel
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set arguments matching the Metal kernel signature
+  compute_encoder.set_input_array(q, 0);           // queries
+  compute_encoder.set_input_array(k, 1);            // keys
+  compute_encoder.set_input_array(qv_data, 2);      // qv_data (uint*)
+  compute_encoder.set_input_array(qv_scales, 3);    // qv_scales (float*)
+  compute_encoder.set_input_array(qv_biases, 4);    // qv_biases (float*)
+  compute_encoder.set_output_array(o, 5);            // out
+  compute_encoder.set_bytes(gqa_factor, 6);
+  compute_encoder.set_bytes(N, 7);
+  compute_encoder.set_bytes(k_head_stride, 8);
+  compute_encoder.set_bytes(k_seq_stride, 9);
+  compute_encoder.set_bytes(qv_data_head_stride, 10);
+  compute_encoder.set_bytes(qv_data_seq_stride, 11);
+  compute_encoder.set_bytes(qv_group_head_stride, 12);
+  compute_encoder.set_bytes(qv_group_seq_stride, 13);
+  compute_encoder.set_bytes(scale_, 14);
+
+  // Launch: same grid as sdpa_vector for L=1
+  MTL::Size group_dims(1024, 1, 1);
+  MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
 } // namespace mlx::core::fast
