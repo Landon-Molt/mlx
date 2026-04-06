@@ -4863,13 +4863,12 @@ class TurboKVCacheLite:
             # Pure KVCache — no compression during decode. Zero overhead.
             return self._kv.update_and_fetch(keys, values)
 
-        # Compacted mode: prefill V is quantized, new decode V stays FP16.
-        # No per-step quantize — zero overhead during decode.
-        # Dequantize prefill V once, concat with raw decode V, return FP16.
-        # Memory savings: prefill V is stored as quantized (compact()).
-        # Speed: native SDPA on FP16 data.
+        # Compacted mode: K=FP16, V=quantized.
+        # Quantize new V per step and append to packed storage.
+        # Return FP16 K + quantized V tuple for C++ sdpa_vector_qv kernel.
+        # For prefill (L>1): dequant to FP16 for native SDPA compatibility.
 
-        # Grow K buffer and store new K (same as KVCache)
+        # K buffer management (same as KVCache)
         prev = self._kv.offset
         if self._kv.keys is None or (prev + keys.shape[2]) > self._kv.keys.shape[2]:
             B, nh, _, dk = keys.shape
@@ -4884,41 +4883,43 @@ class TurboKVCacheLite:
         self._kv.offset += keys.shape[2]
         self._kv.keys[..., prev:self._kv.offset, :] = keys
 
-        # Store new V in FP16 decode tail buffer (pre-allocated)
-        n_prefill = self._qv_data.shape[2]  # Number of quantized prefill tokens
-        n_decode = self._kv.offset - n_prefill  # Decode tokens so far
+        # Quantize new V and append to packed storage
+        _cb = getattr(self, '_compact_bits', 8)
+        _cg = getattr(self, '_compact_group_size', 64)
+        qv, sv, bv = mx.quantize(values, group_size=_cg, bits=_cb)
+        n_new = qv.shape[2]
         _STEP = self._kv.step
+        qv_prev = prev
 
-        if self._kv.values is None or n_decode > self._kv.values.shape[2]:
-            B_v, nh_v, _, d_v = values.shape
-            n_alloc = ((_STEP + values.shape[2] - 1) // _STEP) * _STEP
-            new_v = mx.zeros((B_v, nh_v, n_alloc, d_v), values.dtype)
-            if self._kv.values is not None and n_decode > values.shape[2]:
-                old_decode = n_decode - values.shape[2]
-                new_v[..., :old_decode, :] = self._kv.values[..., :old_decode, :]
-            self._kv.values = new_v
+        if (qv_prev + n_new) > self._qv_data.shape[2]:
+            n_alloc = ((_STEP + n_new - 1) // _STEP) * _STEP
+            for attr in ('_qv_data', '_qv_scales', '_qv_biases'):
+                old = getattr(self, attr)
+                pad = mx.zeros((*old.shape[:2], n_alloc, old.shape[3]), old.dtype)
+                setattr(self, attr, mx.concatenate([old, pad], axis=2))
 
-        decode_start = n_decode - values.shape[2]
-        self._kv.values[..., decode_start:n_decode, :] = values
+        self._qv_data[..., qv_prev:qv_prev + n_new, :] = qv
+        self._qv_scales[..., qv_prev:qv_prev + n_new, :] = sv
+        self._qv_biases[..., qv_prev:qv_prev + n_new, :] = bv
 
-        # Return FP16 K + FP16 V (dequantized prefill + raw decode tail)
         offset = self._kv.offset
         all_keys = self._kv.keys[..., :offset, :]
 
-        _cb = getattr(self, '_compact_bits', 8)
-        _cg = getattr(self, '_compact_group_size', 64)
-        deq_prefill = mx.dequantize(
-            self._qv_data, self._qv_scales, self._qv_biases,
+        # Decode (L=1): return quantized tuple for C++ sdpa_vector_qv kernel
+        if keys.shape[2] == 1:
+            return all_keys, (
+                self._qv_data[..., :offset, :],
+                self._qv_scales[..., :offset, :],
+                self._qv_biases[..., :offset, :],
+            )
+        # Prefill (L>1): dequant to FP16 for native SDPA
+        all_v = mx.dequantize(
+            self._qv_data[..., :offset, :],
+            self._qv_scales[..., :offset, :],
+            self._qv_biases[..., :offset, :],
             group_size=_cg, bits=_cb,
         ).astype(keys.dtype)
-
-        if n_decode > 0:
-            decode_tail = self._kv.values[..., :n_decode, :]
-            all_values = mx.concatenate([deq_prefill, decode_tail], axis=2)
-        else:
-            all_values = deq_prefill
-
-        return all_keys, all_values
+        return all_keys, all_v
 
     def compress(self) -> None:
         """Compress the current KV cache using TurboQuant.
@@ -5249,16 +5250,9 @@ def compact_turbo_cache(cache: list) -> int:
                     if scale is None:
                         scale = D ** -0.5
 
-                    # Try C++ sdpa_vector_qv kernel first (single dispatch, fastest)
-                    if L == 1 and D in (64, 96, 128, 256):
-                        try:
-                            qv_data, qv_scales, qv_biases = values
-                            return mx.fast.scaled_dot_product_attention_qv(
-                                queries, keys, qv_data, qv_scales, qv_biases,
-                                scale=scale, group_size=32,
-                            )
-                        except Exception:
-                            pass  # Fall through to quantized_matmul
+                    # TODO: C++ sdpa_vector_qv8 kernel has quality issues at 8-bit
+                    # (small MAE=0.0002 compounds across 24 layers × N steps).
+                    # Using mx.quantized_matmul fallback which is proven correct.
 
                     # Fallback: manual Q×K + mx.quantized_matmul
                     n_repeats = n_q_heads // n_kv_heads
