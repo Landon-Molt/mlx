@@ -105,6 +105,7 @@ from mlx.nn.layers.transformer import (
 from mlx.nn.layers.turbo_kv_cache import (
     TurboQuantCodebook,
     TurboQuantKVCache,
+    TurboQuantLinear,
     patch_mlx_lm,
     turbo_asymmetric_attention,
     turbo_attention,
@@ -112,6 +113,7 @@ from mlx.nn.layers.turbo_kv_cache import (
     turbo_decode,
     turbo_encode,
     turbo_fused_attention,
+    turbo_quantize_weights,
     turbo_weighted_value_sum,
     unpatch_mlx_lm,
 )

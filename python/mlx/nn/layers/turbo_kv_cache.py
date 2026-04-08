@@ -5530,3 +5530,210 @@ def compact_turbo_cache(cache: list) -> int:
             pass
 
     return total_freed
+
+
+# ---------------------------------------------------------------------------
+# TurboQuant Weight Compression
+# ---------------------------------------------------------------------------
+
+
+class TurboQuantLinear(Module):
+    """Linear layer with TurboQuant weight compression.
+
+    Stores weights as WHT-rotated + Lloyd-Max quantized packed indices.
+    Dequantizes to full precision during forward pass (dequant-then-matmul).
+
+    This is the weight compression counterpart to TurboQuantKVCache.
+    Same math (SRHT + Lloyd-Max centroids), applied to model weights
+    instead of KV cache tensors.
+
+    Args:
+        input_dims (int): The dimensionality of the input features.
+        output_dims (int): The dimensionality of the output features.
+        bias (bool): If set to ``False`` then the layer will not use a bias.
+        bits (int): Quantization bit-width (2, 3, or 4). Default: 4.
+        seed (int): Random seed for the SRHT sign-flip diagonal. Default: 42.
+
+    Example:
+        >>> tql = TurboQuantLinear.from_linear(linear_layer, bits=4)
+        >>> output = tql(input_tensor)
+    """
+
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        bias: bool = True,
+        bits: int = 4,
+        seed: int = 42,
+    ):
+        super().__init__()
+        if bits not in (2, 3, 4):
+            raise ValueError(f"Unsupported bits={bits}. Must be 2, 3, or 4.")
+
+        self.input_dims = input_dims
+        self.output_dims = output_dims
+        self.bits = bits
+        self.seed = seed
+
+        # Initialize with random weights, then compress
+        scale = math.sqrt(1 / input_dims)
+        weight = mx.random.uniform(
+            low=-scale, high=scale, shape=(output_dims, input_dims)
+        )
+        self.weight, self.weight_norms = turbo_encode(weight, bits=bits, seed=seed)
+        if bias:
+            self.bias = mx.zeros((output_dims,))
+
+        self.freeze()
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear_layer: Module,
+        bits: int = 4,
+        seed: int = 42,
+    ):
+        """Create a :obj:`TurboQuantLinear` layer from a :obj:`Linear` or
+        :obj:`QuantizedLinear` layer.
+
+        Args:
+            linear_layer: Source layer to compress.
+            bits: Quantization bit-width (2, 3, or 4). Default: 4.
+            seed: Random seed for SRHT. Default: 42.
+        """
+        # Handle QuantizedLinear — dequantize first
+        if hasattr(linear_layer, "scales"):
+            weight = mx.dequantize(
+                linear_layer.weight,
+                scales=linear_layer.scales,
+                biases=linear_layer.get("biases"),
+                group_size=linear_layer.group_size,
+                bits=linear_layer.bits,
+                mode=getattr(linear_layer, "mode", "affine"),
+            )
+        else:
+            weight = linear_layer.weight
+
+        output_dims, input_dims = weight.shape
+        tql = cls.__new__(cls)
+        Module.__init__(tql)
+
+        tql.input_dims = input_dims
+        tql.output_dims = output_dims
+        tql.bits = bits
+        tql.seed = seed
+
+        tql.weight, tql.weight_norms = turbo_encode(weight, bits=bits, seed=seed)
+
+        if "bias" in linear_layer:
+            tql.bias = linear_layer.bias
+
+        tql.freeze()
+        return tql
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Dequant weights to full precision, then matmul
+        w = turbo_decode(
+            self.weight,
+            self.weight_norms,
+            dim=self.input_dims,
+            bits=self.bits,
+            seed=self.seed,
+        )
+        x = x @ w.T
+        if "bias" in self:
+            x = x + self["bias"]
+        return x
+
+    def _extra_repr(self):
+        return (
+            f"input_dims={self.input_dims}, output_dims={self.output_dims}, "
+            f"bias={'bias' in self}, bits={self.bits}, seed={self.seed}"
+        )
+
+
+def turbo_quantize_weights(
+    model: Module,
+    bits: int = 4,
+    seed: int = 42,
+    boundary: int = 0,
+    class_predicate: Optional[callable] = None,
+) -> Module:
+    """Quantize model weights using TurboQuant (WHT + Lloyd-Max centroids).
+
+    Compresses Linear layers in-place using TurboQuantLinear. By default
+    compresses all Linear layers except embeddings and output head.
+
+    Args:
+        model: nn.Module with Linear layers.
+        bits: Quantization bit-width (2, 3, or 4). Default: 4.
+        seed: Random seed for SRHT. Default: 42.
+        boundary: Number of first+last transformer layers to skip (protect
+            at original precision). 0 = compress all. Default: 0.
+        class_predicate: Optional callable(path, module) -> bool.
+            If provided, overrides default predicate. Return True to compress.
+
+    Returns:
+        model (modified in-place)
+
+    Example:
+        >>> from mlx.nn.layers.turbo_kv_cache import turbo_quantize_weights
+        >>> model = turbo_quantize_weights(model, bits=4, boundary=2)
+    """
+    from mlx.nn.layers.linear import Linear
+    from mlx.nn.layers.quantized import QuantizedLinear
+    from mlx.utils import tree_map_with_path
+
+    # Build set of protected layer indices if boundary > 0
+    _protected_layers = set()
+    if boundary > 0:
+        # Find all unique layer indices in the model
+        layer_indices = set()
+        for path, _ in model.leaf_modules().items():
+            parts = path.split(".")
+            for i, part in enumerate(parts):
+                if part == "layers" and i + 1 < len(parts):
+                    try:
+                        layer_indices.add(int(parts[i + 1]))
+                    except ValueError:
+                        pass
+        if layer_indices:
+            sorted_layers = sorted(layer_indices)
+            n_layers = len(sorted_layers)
+            for i in range(min(boundary, n_layers)):
+                _protected_layers.add(sorted_layers[i])
+                _protected_layers.add(sorted_layers[-(i + 1)])
+
+    def _default_predicate(path: str, m: Module) -> bool:
+        # Skip non-linear layers
+        if not isinstance(m, (Linear, QuantizedLinear)):
+            return False
+        # Skip embeddings and output head
+        lower = path.lower()
+        if "embed" in lower or "lm_head" in lower:
+            return False
+        # Skip protected boundary layers
+        if _protected_layers:
+            parts = path.split(".")
+            for i, part in enumerate(parts):
+                if part == "layers" and i + 1 < len(parts):
+                    try:
+                        layer_idx = int(parts[i + 1])
+                        if layer_idx in _protected_layers:
+                            return False
+                    except ValueError:
+                        pass
+        return True
+
+    predicate = class_predicate or _default_predicate
+
+    def _maybe_compress(path, m):
+        if predicate(path, m):
+            return TurboQuantLinear.from_linear(m, bits=bits, seed=seed)
+        return m
+
+    leaves = model.leaf_modules()
+    leaves = tree_map_with_path(_maybe_compress, leaves, is_leaf=Module.is_module)
+    model.update_modules(leaves)
+    return model
