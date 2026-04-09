@@ -1,5 +1,7 @@
 # TurboQuant KV Cache for MLX — Changelog
 
+> **Note:** For production Apple Silicon inference, use [ekryski/mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm) — Swift MLX achieves 2.5x faster decode than Python mlx-lm (167 vs 65 tok/s on 7B, 144 tok/s on 35B MoE). Same TurboQuant Metal kernels, zero Python overhead. This Python fork remains useful for research and prototyping.
+
 ## feature/turboquant-plus (28 commits)
 
 ### Core Implementation

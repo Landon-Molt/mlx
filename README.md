@@ -1,4 +1,12 @@
-# MLX
+# MLX — TheTom fork (TurboQuant+)
+
+> **⚡ For production Apple Silicon inference, use [ekryski/mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm).**
+>
+> I've been collaborating directly with Eric Kryski on his Swift MLX repo, which is the more mature implementation we're both actively testing and developing on. Swift MLX achieves ~2.5x faster decode than Python mlx-lm on the same hardware (167 vs 65 tok/s on Qwen2.5-7B, 144 tok/s on Qwen3.5-35B-A3B MoE at 4K context on M5 Max). Same TurboQuant Metal kernels, zero Python interpreter overhead.
+>
+> This Python fork remains useful for research and rapid prototyping, but all new TurboQuant+ development is happening in the Swift repo.
+
+---
 
 [**Quickstart**](#quickstart) | [**Installation**](#installation) |
 [**Documentation**](https://ml-explore.github.io/mlx/build/html/index.html) |
