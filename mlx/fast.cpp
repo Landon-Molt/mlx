@@ -861,6 +861,59 @@ array scaled_dot_product_attention(
   return fallback(std::move(inputs))[0];
 }
 
+array scaled_dot_product_attention_tq(
+    const array& q_rot,
+    const array& q_proj,
+    const array& key_norms,
+    const array& key_mse_indices,
+    const array& key_res_norms,
+    const array& key_signs,
+    const array& val_norms,
+    const array& val_indices,
+    const array& key_codebook,
+    const array& key_scale,
+    const array& val_codebook,
+    const float scale,
+    int gqa_factor,
+    int key_bits,
+    int val_bits,
+    StreamOrDevice s) {
+  // q_rot, q_proj: (B*n_q_heads, L, D) — pre-transformed queries
+  // key_*: (B*n_kv_heads, T, ...) — TQ key state
+  // val_*: (B*n_kv_heads, T, ...) — TQ value state
+
+  if (q_rot.ndim() != 3 || q_proj.ndim() != 3) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_tq] q_rot and q_proj expected to be rank 3 (B*H, L, D)");
+  }
+
+  int n_q_heads_total = q_rot.shape(0);
+  int L = q_rot.shape(1);
+  int D = q_rot.shape(2);
+
+  auto final_type = q_rot.dtype();
+  Shape out_shape{n_q_heads_total, L, D};
+
+  // Simple fallback: dequantize + matmul (not optimized)
+  auto fallback = [](const std::vector<array>& inputs) {
+    throw std::runtime_error(
+        "[scaled_dot_product_attention_tq] CPU fallback not implemented");
+    return std::vector<array>{};
+  };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {
+      q_rot, q_proj,
+      key_norms, key_mse_indices, key_res_norms, key_signs,
+      val_norms, val_indices,
+      key_codebook, key_scale, val_codebook};
+
+  auto primitive = std::make_shared<ScaledDotProductAttentionTQ>(
+      stream, fallback, scale, gqa_factor, key_bits, val_bits);
+
+  return array(std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

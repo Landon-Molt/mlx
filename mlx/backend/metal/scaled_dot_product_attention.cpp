@@ -785,6 +785,97 @@ void ScaledDotProductAttention::eval_gpu(
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
 }
 
+void ScaledDotProductAttentionTQ::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& o = outputs[0];
+
+  // Unpack inputs
+  const auto& q_rot = inputs[0];
+  const auto& q_proj = inputs[1];
+  const auto& key_norms = inputs[2];
+  const auto& key_mse_indices = inputs[3];
+  const auto& key_res_norms = inputs[4];
+  const auto& key_signs = inputs[5];
+  const auto& val_norms = inputs[6];
+  const auto& val_indices = inputs[7];
+  const auto& key_codebook = inputs[8];
+  const auto& key_scale = inputs[9];
+  const auto& val_codebook = inputs[10];
+
+  int n_q_heads_total = q_rot.shape(0);
+  int L = q_rot.shape(1);
+  int D = q_rot.shape(2);
+  int N = key_norms.shape(1);  // KV sequence length
+
+  o.set_data(allocator::malloc(o.nbytes()));
+
+  // Build kernel name: sdpa_vector_tq_<type>_<D>_k<K>_v<V>
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_tq_";
+  kname += get_type_string(q_rot.dtype());
+  kname += "_";
+  kname += std::to_string(D);
+  kname += "_k";
+  kname += std::to_string(key_bits_);
+  kname += "_v";
+  kname += std::to_string(val_bits_);
+
+  // Function constants
+  bool has_mask = false;
+  bool do_causal = false;
+  bool bool_mask = false;
+  bool float_mask = false;
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
+  };
+  std::string hash_name = kname + "_nomask";
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Strides for KV: (B*H, T, packed_width)
+  size_t k_head_stride = key_norms.shape(1);  // T elements per head
+  size_t v_head_stride = val_norms.shape(1);
+
+  // Set buffers matching sdpa_vector_tq.h buffer indices
+  compute_encoder.set_input_array(q_rot, 0);
+  compute_encoder.set_input_array(q_proj, 1);
+  compute_encoder.set_input_array(key_norms, 2);
+  compute_encoder.set_input_array(key_mse_indices, 3);
+  compute_encoder.set_input_array(key_res_norms, 4);
+  compute_encoder.set_input_array(key_signs, 5);
+  compute_encoder.set_input_array(val_norms, 6);
+  compute_encoder.set_input_array(val_indices, 7);
+  compute_encoder.set_input_array(key_codebook, 8);
+  compute_encoder.set_input_array(key_scale, 9);
+  compute_encoder.set_input_array(val_codebook, 10);
+  compute_encoder.set_output_array(o, 11);
+  compute_encoder.set_bytes(gqa_factor_, 12);
+  compute_encoder.set_bytes(N, 13);
+  compute_encoder.set_bytes(k_head_stride, 14);
+  compute_encoder.set_bytes(v_head_stride, 15);
+
+  // Grid: one threadgroup per (q_batch_head, q_seq_idx)
+  MTL::Size group_dims(1024, 1, 1);  // BN*BD = 32*32
+  MTL::Size grid_dims(n_q_heads_total, L, 1);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+bool ScaledDotProductAttentionTQ::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const ScaledDotProductAttentionTQ&>(other);
+  return scale_ == o.scale_ && gqa_factor_ == o.gqa_factor_ &&
+      key_bits_ == o.key_bits_ && val_bits_ == o.val_bits_;
+}
+
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
   return true;
 }

@@ -54,6 +54,24 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+MLX_API array scaled_dot_product_attention_tq(
+    const array& q_rot,
+    const array& q_proj,
+    const array& key_norms,
+    const array& key_mse_indices,
+    const array& key_res_norms,
+    const array& key_signs,
+    const array& val_norms,
+    const array& val_indices,
+    const array& key_codebook,
+    const array& key_scale,
+    const array& val_codebook,
+    const float scale,
+    int gqa_factor,
+    int key_bits,
+    int val_bits,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

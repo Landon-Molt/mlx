@@ -297,6 +297,78 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_tq",
+      [](const mx::array& q_rot,
+         const mx::array& q_proj,
+         const mx::array& key_norms,
+         const mx::array& key_mse_indices,
+         const mx::array& key_res_norms,
+         const mx::array& key_signs,
+         const mx::array& val_norms,
+         const mx::array& val_indices,
+         const mx::array& key_codebook,
+         const mx::array& key_scale,
+         const mx::array& val_codebook,
+         float scale,
+         int gqa_factor,
+         int key_bits,
+         int val_bits,
+         mx::StreamOrDevice s) {
+        return mx::fast::scaled_dot_product_attention_tq(
+            q_rot, q_proj,
+            key_norms, key_mse_indices, key_res_norms, key_signs,
+            val_norms, val_indices,
+            key_codebook, key_scale, val_codebook,
+            scale, gqa_factor, key_bits, val_bits, s);
+      },
+      "q_rot"_a,
+      "q_proj"_a,
+      "key_norms"_a,
+      "key_mse_indices"_a,
+      "key_res_norms"_a,
+      "key_signs"_a,
+      "val_norms"_a,
+      "val_indices"_a,
+      "key_codebook"_a,
+      "key_scale"_a,
+      "val_codebook"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "gqa_factor"_a,
+      "key_bits"_a,
+      "val_bits"_a,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_tq(q_rot: array, q_proj: array, key_norms: array, key_mse_indices: array, key_res_norms: array, key_signs: array, val_norms: array, val_indices: array, key_codebook: array, key_scale: array, val_codebook: array, *, scale: float, gqa_factor: int, key_bits: int, val_bits: int, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        TurboQuant-aware scaled dot product attention.
+
+        Reads keys from ProdCodec (MSE codebook + QJL signs) and values
+        from MSECodec (codebook + norms) format. Queries must be
+        pre-transformed via key_codec.prepare_queries().
+
+        Args:
+            q_rot: Pre-rotated queries ``(B*n_q_heads, L, D)``
+            q_proj: Pre-projected queries ``(B*n_q_heads, L, D)``
+            key_norms: Key norms ``(B*n_kv_heads, T)``
+            key_mse_indices: Packed key codebook indices ``(B*n_kv_heads, T, packed_w)``
+            key_res_norms: Key QJL residual norms ``(B*n_kv_heads, T)``
+            key_signs: Key QJL sign bits ``(B*n_kv_heads, T, sign_w)``
+            val_norms: Value norms ``(B*n_kv_heads, T)``
+            val_indices: Packed value codebook indices ``(B*n_kv_heads, T, packed_w)``
+            key_codebook: Key MSE codebook ``(2^key_bits,)``
+            key_scale: Key QJL scale ``(1,)``
+            val_codebook: Value MSE codebook ``(2^val_bits,)``
+            scale: Attention scale factor
+            gqa_factor: Number of query heads per KV head
+            key_bits: Key MSE quantization bits
+            val_bits: Value quantization bits
+
+        Returns:
+            Attention output ``(B*n_q_heads, L, D)``
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,
