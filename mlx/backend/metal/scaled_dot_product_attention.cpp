@@ -825,8 +825,8 @@ void ScaledDotProductAttentionTQ::eval_gpu(
   kname += std::to_string(val_bits_);
 
   // Function constants
-  bool has_mask = false;
-  bool do_causal = false;
+  bool has_mask = do_causal_ && L > 1;
+  bool do_causal = do_causal_ && L > 1;
   bool bool_mask = false;
   bool float_mask = false;
   metal::MTLFCList func_consts = {
@@ -835,7 +835,8 @@ void ScaledDotProductAttentionTQ::eval_gpu(
       {&bool_mask, MTL::DataType::DataTypeBool, 23},
       {&float_mask, MTL::DataType::DataTypeBool, 24},
   };
-  std::string hash_name = kname + "_nomask";
+  std::string hash_name = kname;
+  hash_name += do_causal ? "_causal" : "_nomask";
 
   auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
@@ -863,17 +864,17 @@ void ScaledDotProductAttentionTQ::eval_gpu(
   compute_encoder.set_bytes(k_head_stride, 14);
   compute_encoder.set_bytes(v_head_stride, 15);
 
-  // Grid: one threadgroup per (q_batch_head, q_seq_idx)
+  // Single dispatch — one threadgroup per (q_batch_head, q_seq_idx)
   MTL::Size group_dims(1024, 1, 1);  // BN*BD = 32*32
   MTL::Size grid_dims(n_q_heads_total, L, 1);
-
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 bool ScaledDotProductAttentionTQ::is_equivalent(const Primitive& other) const {
   const auto& o = static_cast<const ScaledDotProductAttentionTQ&>(other);
   return scale_ == o.scale_ && gqa_factor_ == o.gqa_factor_ &&
-      key_bits_ == o.key_bits_ && val_bits_ == o.val_bits_;
+      key_bits_ == o.key_bits_ && val_bits_ == o.val_bits_ &&
+      do_causal_ == o.do_causal_;
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {

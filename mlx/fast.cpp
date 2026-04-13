@@ -877,6 +877,7 @@ array scaled_dot_product_attention_tq(
     int gqa_factor,
     int key_bits,
     int val_bits,
+    bool do_causal,
     StreamOrDevice s) {
   // q_rot, q_proj: (B*n_q_heads, L, D) — pre-transformed queries
   // key_*: (B*n_kv_heads, T, ...) — TQ key state
@@ -909,7 +910,7 @@ array scaled_dot_product_attention_tq(
       key_codebook, key_scale, val_codebook};
 
   auto primitive = std::make_shared<ScaledDotProductAttentionTQ>(
-      stream, fallback, scale, gqa_factor, key_bits, val_bits);
+      stream, fallback, scale, gqa_factor, key_bits, val_bits, do_causal);
 
   return array(std::move(out_shape), final_type, primitive, std::move(inputs));
 }

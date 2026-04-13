@@ -268,12 +268,14 @@ class ScaledDotProductAttentionTQ : public Custom {
       float scale,
       int gqa_factor,
       int key_bits,
-      int val_bits)
+      int val_bits,
+      bool do_causal)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         gqa_factor_(gqa_factor),
         key_bits_(key_bits),
-        val_bits_(val_bits) {}
+        val_bits_(val_bits),
+        do_causal_(do_causal) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -293,6 +295,7 @@ class ScaledDotProductAttentionTQ : public Custom {
   int gqa_factor_;
   int key_bits_;
   int val_bits_;
+  bool do_causal_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {

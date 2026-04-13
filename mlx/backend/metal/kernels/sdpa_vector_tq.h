@@ -15,6 +15,7 @@ constant bool has_mask [[function_constant(20)]];
 constant bool do_causal [[function_constant(22)]];
 constant bool bool_mask [[function_constant(23)]];
 constant bool float_mask [[function_constant(24)]];
+constant int blocks [[function_constant(26)]];
 
 // TQ decode kernel: one query position per threadgroup.
 // Grid: (B*n_q_heads, q_seq_len, 1)
@@ -234,5 +235,163 @@ template <typename T, int D, int K_BITS, int V_BITS>
     for (int i = 0; i < elem_per_thread; i++) {
       out[i] = static_cast<T>(o[i]);
     }
+  }
+}
+
+
+// 2-pass variant: each block handles a subset of KV tokens.
+// Pass 1 writes unnormalized partials; pass 2 (sdpa_vector_2pass_2) merges.
+// This parallelizes long T across blocks for better GPU utilization.
+template <typename T, int D, int K_BITS, int V_BITS>
+[[kernel]] void sdpa_vector_tq_2pass_1(
+    const device T* q_rot [[buffer(0)]],
+    const device T* q_proj [[buffer(1)]],
+    const device T* key_norms [[buffer(2)]],
+    const device uint32_t* key_mse_indices [[buffer(3)]],
+    const device T* key_res_norms [[buffer(4)]],
+    const device uint32_t* key_signs [[buffer(5)]],
+    const device T* val_norms [[buffer(6)]],
+    const device uint32_t* val_indices [[buffer(7)]],
+    const device float* key_codebook [[buffer(8)]],
+    const device float* key_scale [[buffer(9)]],
+    const device float* val_codebook [[buffer(10)]],
+    device T* out [[buffer(11)]],
+    device float* sums [[buffer(12)]],
+    device float* maxs [[buffer(13)]],
+    const constant int& gqa_factor [[buffer(14)]],
+    const constant int& N [[buffer(15)]],
+    const constant size_t& k_head_stride [[buffer(16)]],
+    const constant size_t& v_head_stride [[buffer(17)]],
+    const device bool* bmask [[buffer(18), function_constant(bool_mask)]],
+    const device T* fmask [[buffer(19), function_constant(float_mask)]],
+    const constant int& mask_kv_seq_stride
+        [[buffer(20), function_constant(has_mask)]],
+    const constant int& mask_q_seq_stride
+        [[buffer(21), function_constant(has_mask)]],
+    const constant int& mask_head_stride
+        [[buffer(22), function_constant(has_mask)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  constexpr uint K_MSE_MASK = (1u << K_BITS) - 1u;
+  constexpr uint V_MASK = (1u << V_BITS) - 1u;
+  constexpr int k_packed_width = (D * K_BITS + 31) / 32;
+  constexpr int k_sign_width = (D + 31) / 32;
+  constexpr int v_packed_width = (D * V_BITS + 31) / 32;
+
+  typedef float U;
+
+  thread U qr[elem_per_thread];
+  thread U qp[elem_per_thread];
+  thread U o[elem_per_thread] = {0};
+
+  // Block/head indices — grid: (n_kv_heads, B, blocks)
+  // threadgroup: (BD=32, gqa_factor, q_seq_len)
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int block_idx = tid.z;
+  const int q_seq_idx = tidtg.z;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_seq_len = tptg.z;
+  const int q_batch_head_idx = batch_idx * num_q_heads + q_head_idx;
+  const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
+
+  // Query pointers
+  const int q_base = o_offset * D + simd_lid * elem_per_thread;
+
+  // KV head offsets
+  const int kv_batch_head = batch_idx * num_kv_heads + kv_head_idx;
+  const int kv_base = kv_batch_head * int(k_head_stride);
+  const int vv_base = kv_batch_head * int(v_head_stride);
+  const U kscale = key_scale[0];
+
+  // Load query
+  for (int i = 0; i < elem_per_thread; i++) {
+    qr[i] = static_cast<U>(q_rot[q_base + i]);
+    qp[i] = static_cast<U>(q_proj[q_base + i]);
+  }
+
+  // Precompute V bit offsets
+  int v_words[elem_per_thread], v_offs_arr[elem_per_thread];
+  bool v_spills[elem_per_thread];
+  for (int i = 0; i < elem_per_thread; i++) {
+    int d = simd_lid * elem_per_thread + i;
+    int bo = d * V_BITS;
+    v_words[i] = bo / 32;
+    v_offs_arr[i] = bo % 32;
+    v_spills[i] = (bo % 32 + V_BITS) > 32;
+  }
+
+  // Output pointers — per-block partials
+  out += o_offset * blocks * D + block_idx * D + simd_lid * elem_per_thread;
+  sums += o_offset * blocks + block_idx;
+  maxs += o_offset * blocks + block_idx;
+
+  U max_score = -1e38f;
+  U sum_exp_score = 0;
+
+  // Main loop: stride by blocks
+  for (int i = block_idx; i < N; i += blocks) {
+    bool use_key = true;
+    if (do_causal) {
+      use_key = i <= (N - q_seq_len + q_seq_idx);
+    }
+
+    if (use_key) {
+      const device uint32_t* mse_ptr = key_mse_indices + kv_base * k_packed_width + i * k_packed_width;
+      const device uint32_t* sign_ptr = key_signs + kv_base * k_sign_width + i * k_sign_width;
+      U kn = static_cast<U>(key_norms[kv_base + i]);
+      U ksr = kn * kscale * static_cast<U>(key_res_norms[kv_base + i]);
+
+      U score = 0;
+      for (int j = 0; j < elem_per_thread; j++) {
+        int d = simd_lid * elem_per_thread + j;
+        int bo = d * K_BITS;
+        uint idx = (mse_ptr[bo >> 5] >> (bo & 31));
+        if ((bo & 31) + K_BITS > 32) {
+          idx |= mse_ptr[(bo >> 5) + 1] << (K_BITS - ((bo & 31) + K_BITS - 32));
+        }
+        idx &= K_MSE_MASK;
+        U code = key_codebook[idx];
+        uint sb = (sign_ptr[d >> 5] >> (d & 31)) & 1u;
+        score += kn * qr[j] * code + ksr * (sb ? qp[j] : -qp[j]);
+      }
+      score = simd_sum(score);
+
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+
+      const device uint32_t* vt = val_indices + vv_base * v_packed_width + i * v_packed_width;
+      U vnorm = static_cast<U>(val_norms[vv_base + i]);
+      for (int j = 0; j < elem_per_thread; j++) {
+        uint vv = (vt[v_words[j]] >> v_offs_arr[j]);
+        if (v_spills[j]) {
+          vv |= vt[v_words[j] + 1] << (V_BITS - (v_offs_arr[j] + V_BITS - 32));
+        }
+        vv &= V_MASK;
+        U v_code = val_codebook[vv] * vnorm;
+        o[j] = o[j] * factor + exp_score * v_code;
+      }
+    }
+  }
+
+  // Write unnormalized partials
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+  for (int i = 0; i < elem_per_thread; i++) {
+    out[i] = static_cast<T>(o[i]);
   }
 }

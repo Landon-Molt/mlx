@@ -313,13 +313,14 @@ void init_fast(nb::module_& parent_module) {
          int gqa_factor,
          int key_bits,
          int val_bits,
+         bool do_causal,
          mx::StreamOrDevice s) {
         return mx::fast::scaled_dot_product_attention_tq(
             q_rot, q_proj,
             key_norms, key_mse_indices, key_res_norms, key_signs,
             val_norms, val_indices,
             key_codebook, key_scale, val_codebook,
-            scale, gqa_factor, key_bits, val_bits, s);
+            scale, gqa_factor, key_bits, val_bits, do_causal, s);
       },
       "q_rot"_a,
       "q_proj"_a,
@@ -337,9 +338,10 @@ void init_fast(nb::module_& parent_module) {
       "gqa_factor"_a,
       "key_bits"_a,
       "val_bits"_a,
+      "do_causal"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention_tq(q_rot: array, q_proj: array, key_norms: array, key_mse_indices: array, key_res_norms: array, key_signs: array, val_norms: array, val_indices: array, key_codebook: array, key_scale: array, val_codebook: array, *, scale: float, gqa_factor: int, key_bits: int, val_bits: int, stream: Union[None, Stream, Device] = None) -> array"),
+          "def scaled_dot_product_attention_tq(q_rot: array, q_proj: array, key_norms: array, key_mse_indices: array, key_res_norms: array, key_signs: array, val_norms: array, val_indices: array, key_codebook: array, key_scale: array, val_codebook: array, *, scale: float, gqa_factor: int, key_bits: int, val_bits: int, do_causal: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         TurboQuant-aware scaled dot product attention.
 

@@ -70,6 +70,7 @@ MLX_API array scaled_dot_product_attention_tq(
     int gqa_factor,
     int key_bits,
     int val_bits,
+    bool do_causal = false,
     StreamOrDevice s = {});
 
 using TemplateArg = std::variant<int, bool, Dtype>;
