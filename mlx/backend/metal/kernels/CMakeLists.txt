@@ -99,6 +99,22 @@ set(STEEL_ATTN_HEADERS
     steel/attn/transforms.h
     steel/attn/kernels/steel_attention.h)
 
+set(STEEL_ATTN_TQ_HEADERS
+    steel/defines.h
+    steel/utils.h
+    steel/gemm/gemm.h
+    steel/gemm/mma.h
+    steel/gemm/loader.h
+    steel/gemm/transforms.h
+    steel/utils/type_traits.h
+    steel/utils/integral_constant.h
+    steel/attn/attn.h
+    steel/attn/loader.h
+    steel/attn/mma.h
+    steel/attn/params.h
+    steel/attn/transforms.h
+    steel/attn/kernels/steel_attention_tq.h)
+
 set(STEEL_NAX_HEADERS
     steel/defines.h
     steel/utils.h
@@ -154,6 +170,7 @@ if(NOT MLX_METAL_JIT)
   build_kernel(steel/gemm/kernels/steel_gemm_segmented ${STEEL_HEADERS})
   build_kernel(gemv_masked steel/utils.h)
   build_kernel(steel/attn/kernels/steel_attention ${STEEL_ATTN_HEADERS})
+  build_kernel(steel_attention_tq ${STEEL_ATTN_TQ_HEADERS})
 
   if((MLX_METAL_VERSION GREATER_EQUAL 400) AND (MACOS_SDK_VERSION GREATER_EQUAL
                                                 26.2))
