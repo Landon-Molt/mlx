@@ -9,6 +9,8 @@
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/fast.h"
+#include "mlx/ops.h"
 #include "mlx/utils.h"
 
 namespace mlx::core::fast {
@@ -879,7 +881,8 @@ void ScaledDotProductAttentionQV::eval_gpu(
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
-  if (L <= 8) {
+  {
+    // Decode only (L<=1). Prefill (L>1) rejected in fast.cpp.
     // === Decode path: sdpa_vector_qv (TheTom's original) ===
     std::string kname;
     kname.reserve(64);
@@ -935,88 +938,6 @@ void ScaledDotProductAttentionQV::eval_gpu(
 
     MTL::Size group_dims(1024, 1, 1);
     MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-  } else {
-    // === Prefill path: steel attention_qv (tiled flash attention) ===
-    using namespace mlx::steel;
-
-    int B = q.shape(0);
-    int H = q.shape(1);
-    int BQ = 32;
-    int BK = D <= 128 ? 32 : 16;
-    int WM = 4;
-    int WN = 1;
-
-    std::string kname;
-    kname.reserve(128);
-    kname += "attention_qv_";
-    kname += get_type_string(q.dtype());
-    kname += "_bq";
-    kname += std::to_string(BQ);
-    kname += "_bk";
-    kname += std::to_string(BK);
-    kname += "_bd";
-    kname += std::to_string(D);
-    kname += "_wm";
-    kname += std::to_string(WM);
-    kname += "_wn";
-    kname += std::to_string(WN);
-
-    bool align_Q = (L % BQ) == 0;
-    bool align_K = (N % BK) == 0;
-    bool has_mask = false;
-    bool do_causal = false;
-    metal::MTLFCList func_consts = {
-        {&align_Q, MTL::DataType::DataTypeBool, 200},
-        {&align_K, MTL::DataType::DataTypeBool, 201},
-        {&has_mask, MTL::DataType::DataTypeBool, 300},
-        {&do_causal, MTL::DataType::DataTypeBool, 301},
-    };
-
-    std::string hash_name = kname;
-    hash_name += align_Q ? "_aQ" : "_nQ";
-    hash_name += align_K ? "_aK" : "_nK";
-
-    auto kernel = d.get_kernel(kname, hash_name, func_consts);
-    compute_encoder.set_compute_pipeline_state(kernel);
-
-    int NQ = (L + BQ - 1) / BQ;
-    int NK = (N + BK - 1) / BK;
-
-    AttnParams attn_params{
-        /* B = */ B,
-        /* H = */ H,
-        /* D = */ D,
-        /* qL = */ L,
-        /* kL = */ N,
-        /* gqa_factor = */ gqa_factor,
-        /* scale = */ scale_,
-        /* NQ = */ NQ,
-        /* NK = */ NK,
-        /* NQ_aligned = */ L / BQ,
-        /* NK_aligned = */ N / BK,
-        /* qL_rem = */ L - (L / BQ) * BQ,
-        /* kL_rem = */ N - (N / BK) * BK,
-        /* qL_off = */ N - L,
-        /* Q_strides = */ {q.strides(0), q.strides(1), q.strides(2)},
-        /* K_strides = */ {k.strides(0), k.strides(1), k.strides(2)},
-        /* V_strides = */ {0, 0, 0},  // unused — V loaded manually
-        /* O_strides = */ {o.strides(0), o.strides(1), o.strides(2)},
-    };
-
-    compute_encoder.set_input_array(q, 0);
-    compute_encoder.set_input_array(k, 1);
-    compute_encoder.set_input_array(qv_data, 2);
-    compute_encoder.set_input_array(qv_scales, 3);
-    compute_encoder.set_input_array(qv_biases, 4);
-    compute_encoder.set_output_array(o, 5);
-    compute_encoder.set_bytes(attn_params, 6);
-    compute_encoder.set_bytes(qv_data_head_stride, 7);
-    compute_encoder.set_bytes(qv_group_head_stride, 8);
-    compute_encoder.set_bytes(group_size_, 9);
-
-    MTL::Size grid_dims(NQ, H, B);
-    MTL::Size group_dims(32, WM, WN);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 

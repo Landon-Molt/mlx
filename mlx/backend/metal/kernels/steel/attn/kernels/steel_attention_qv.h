@@ -77,12 +77,15 @@ template <
   K += tidl.z * params->K_strides[0] +
       kv_head_idx * params->K_strides[1];
 
-  // V quantized data: (B, n_kv_heads, T, packed_per_row)
-  ulong v_batch_head = tidl.z * params->K_strides[0] / params->kL +
-      kv_head_idx;
-  const device uint* vd_base = qv_data + v_batch_head * qv_data_head_stride;
-  const device float* vs_base = qv_scales + v_batch_head * qv_group_head_stride;
-  const device float* vb_base = qv_biases + v_batch_head * qv_group_head_stride;
+  // V quantized data layout: (B, n_kv_heads, T, packed_per_row)
+  // qv_data_head_stride = T * packed_per_row (per-head in uint32 words)
+  // qv_group_head_stride = T * groups_per_row (per-head in floats)
+  ulong n_kv_heads = params->H / params->gqa_factor;
+  ulong vd_batch_stride = n_kv_heads * qv_data_head_stride;
+  ulong vg_batch_stride = n_kv_heads * qv_group_head_stride;
+  const device uint* vd_base = qv_data + tidl.z * vd_batch_stride + kv_head_idx * qv_data_head_stride;
+  const device float* vs_base = qv_scales + tidl.z * vg_batch_stride + kv_head_idx * qv_group_head_stride;
+  const device float* vb_base = qv_biases + tidl.z * vg_batch_stride + kv_head_idx * qv_group_head_stride;
 
   O += tidl.z * params->O_strides[0] +
       tidl.y * params->O_strides[1] +

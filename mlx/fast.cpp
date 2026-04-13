@@ -953,7 +953,15 @@ array scaled_dot_product_attention_qv(
         "expected to be rank 4");
   }
 
-  // L=1 (decode) uses sdpa_vector_qv, L>1 (prefill) uses steel attention_qv
+  // Decode only: L must be 1 (prefill L>1 handled by dequant+native SDPA in Python)
+  // TODO: steel attention_qv kernel for fused prefill
+  if (queries.shape(2) != 1) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_qv] only L=1 (decode) supported, "
+        << "got L=" << queries.shape(2)
+        << ". For prefill, dequantize V and use scaled_dot_product_attention.";
+    throw std::invalid_argument(msg.str());
+  }
 
   // Batch dims must match
   if (queries.shape(0) != keys.shape(0)) {
