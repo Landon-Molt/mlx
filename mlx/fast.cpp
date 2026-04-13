@@ -953,13 +953,7 @@ array scaled_dot_product_attention_qv(
         "expected to be rank 4");
   }
 
-  // Decode only: L must be 1
-  if (queries.shape(2) != 1) {
-    std::ostringstream msg;
-    msg << "[scaled_dot_product_attention_qv] only L=1 (decode) supported, "
-        << "got L=" << queries.shape(2);
-    throw std::invalid_argument(msg.str());
-  }
+  // L=1 (decode) uses sdpa_vector_qv, L>1 (prefill) uses steel attention_qv
 
   // Batch dims must match
   if (queries.shape(0) != keys.shape(0)) {

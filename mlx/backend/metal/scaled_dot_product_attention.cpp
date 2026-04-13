@@ -867,79 +867,158 @@ void ScaledDotProductAttentionQV::eval_gpu(
   }
 
   int D = q.shape(-1);
-
-  // Build kernel name: "sdpa_vector_qv[8]_{type}_{D}"
-  std::string kname;
-  kname.reserve(64);
-  if (group_size_ == 64) {
-    kname += "sdpa_vector_qv8_";
-  } else {
-    kname += "sdpa_vector_qv_";
-  }
-  kname += get_type_string(q.dtype());
-  kname += "_";
-  kname += std::to_string(D);
-
-  // Compute strides and sizes
+  int L = q.shape(2);
   int gqa_factor = q.shape(1) / k.shape(1);
   int N = k.shape(2);
-  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
-  size_t k_seq_stride = k.strides()[2];
 
-  // V data strides (in uint32 words)
+  // V data strides
   size_t qv_data_head_stride =
       qv_data.shape(1) == 1 ? qv_data.strides(0) : qv_data.strides(1);
-  size_t qv_data_seq_stride = qv_data.strides()[2];
-
-  // V scales/biases strides (in floats)
   size_t qv_group_head_stride =
       qv_scales.shape(1) == 1 ? qv_scales.strides(0) : qv_scales.strides(1);
-  size_t qv_group_seq_stride = qv_scales.strides()[2];
 
-  // Function constants — reuse the same IDs as sdpa_vector
-  bool has_mask = false;
-  bool query_transposed = !q.flags().row_contiguous;
-  bool do_causal = false;
-  bool bool_mask = false;
-  bool float_mask = false;
-  bool has_sinks = false;
-  metal::MTLFCList func_consts = {
-      {&has_mask, MTL::DataType::DataTypeBool, 20},
-      {&query_transposed, MTL::DataType::DataTypeBool, 21},
-      {&do_causal, MTL::DataType::DataTypeBool, 22},
-      {&bool_mask, MTL::DataType::DataTypeBool, 23},
-      {&float_mask, MTL::DataType::DataTypeBool, 24},
-      {&has_sinks, MTL::DataType::DataTypeBool, 25},
-  };
-  std::string hash_name = kname;
-  hash_name += query_transposed ? "_qt" : "_qnt";
-
-  // Get the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = d.get_kernel(kname, hash_name, func_consts);
-  compute_encoder.set_compute_pipeline_state(kernel);
 
-  // Set arguments matching the Metal kernel signature
-  compute_encoder.set_input_array(q, 0);           // queries
-  compute_encoder.set_input_array(k, 1);            // keys
-  compute_encoder.set_input_array(qv_data, 2);      // qv_data (uint*)
-  compute_encoder.set_input_array(qv_scales, 3);    // qv_scales (float*)
-  compute_encoder.set_input_array(qv_biases, 4);    // qv_biases (float*)
-  compute_encoder.set_output_array(o, 5);            // out
-  compute_encoder.set_bytes(gqa_factor, 6);
-  compute_encoder.set_bytes(N, 7);
-  compute_encoder.set_bytes(k_head_stride, 8);
-  compute_encoder.set_bytes(k_seq_stride, 9);
-  compute_encoder.set_bytes(qv_data_head_stride, 10);
-  compute_encoder.set_bytes(qv_data_seq_stride, 11);
-  compute_encoder.set_bytes(qv_group_head_stride, 12);
-  compute_encoder.set_bytes(qv_group_seq_stride, 13);
-  compute_encoder.set_bytes(scale_, 14);
+  if (L <= 8) {
+    // === Decode path: sdpa_vector_qv (TheTom's original) ===
+    std::string kname;
+    kname.reserve(64);
+    if (group_size_ == 64) {
+      kname += "sdpa_vector_qv8_";
+    } else {
+      kname += "sdpa_vector_qv_";
+    }
+    kname += get_type_string(q.dtype());
+    kname += "_";
+    kname += std::to_string(D);
 
-  // Launch: same grid as sdpa_vector for L=1
-  MTL::Size group_dims(1024, 1, 1);
-  MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+    size_t k_seq_stride = k.strides()[2];
+    size_t qv_data_seq_stride = qv_data.strides()[2];
+    size_t qv_group_seq_stride = qv_scales.strides()[2];
+
+    bool has_mask = false;
+    bool query_transposed = !q.flags().row_contiguous;
+    bool do_causal = false;
+    bool bool_mask = false;
+    bool float_mask = false;
+    bool has_sinks = false;
+    metal::MTLFCList func_consts = {
+        {&has_mask, MTL::DataType::DataTypeBool, 20},
+        {&query_transposed, MTL::DataType::DataTypeBool, 21},
+        {&do_causal, MTL::DataType::DataTypeBool, 22},
+        {&bool_mask, MTL::DataType::DataTypeBool, 23},
+        {&float_mask, MTL::DataType::DataTypeBool, 24},
+        {&has_sinks, MTL::DataType::DataTypeBool, 25},
+    };
+    std::string hash_name = kname;
+    hash_name += query_transposed ? "_qt" : "_qnt";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(qv_data, 2);
+    compute_encoder.set_input_array(qv_scales, 3);
+    compute_encoder.set_input_array(qv_biases, 4);
+    compute_encoder.set_output_array(o, 5);
+    compute_encoder.set_bytes(gqa_factor, 6);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(k_head_stride, 8);
+    compute_encoder.set_bytes(k_seq_stride, 9);
+    compute_encoder.set_bytes(qv_data_head_stride, 10);
+    compute_encoder.set_bytes(qv_data_seq_stride, 11);
+    compute_encoder.set_bytes(qv_group_head_stride, 12);
+    compute_encoder.set_bytes(qv_group_seq_stride, 13);
+    compute_encoder.set_bytes(scale_, 14);
+
+    MTL::Size group_dims(1024, 1, 1);
+    MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  } else {
+    // === Prefill path: steel attention_qv (tiled flash attention) ===
+    using namespace mlx::steel;
+
+    int B = q.shape(0);
+    int H = q.shape(1);
+    int BQ = 32;
+    int BK = D <= 128 ? 32 : 16;
+    int WM = 4;
+    int WN = 1;
+
+    std::string kname;
+    kname.reserve(128);
+    kname += "attention_qv_";
+    kname += get_type_string(q.dtype());
+    kname += "_bq";
+    kname += std::to_string(BQ);
+    kname += "_bk";
+    kname += std::to_string(BK);
+    kname += "_bd";
+    kname += std::to_string(D);
+    kname += "_wm";
+    kname += std::to_string(WM);
+    kname += "_wn";
+    kname += std::to_string(WN);
+
+    bool align_Q = (L % BQ) == 0;
+    bool align_K = (N % BK) == 0;
+    bool has_mask = false;
+    bool do_causal = false;
+    metal::MTLFCList func_consts = {
+        {&align_Q, MTL::DataType::DataTypeBool, 200},
+        {&align_K, MTL::DataType::DataTypeBool, 201},
+        {&has_mask, MTL::DataType::DataTypeBool, 300},
+        {&do_causal, MTL::DataType::DataTypeBool, 301},
+    };
+
+    std::string hash_name = kname;
+    hash_name += align_Q ? "_aQ" : "_nQ";
+    hash_name += align_K ? "_aK" : "_nK";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int NQ = (L + BQ - 1) / BQ;
+    int NK = (N + BK - 1) / BK;
+
+    AttnParams attn_params{
+        /* B = */ B,
+        /* H = */ H,
+        /* D = */ D,
+        /* qL = */ L,
+        /* kL = */ N,
+        /* gqa_factor = */ gqa_factor,
+        /* scale = */ scale_,
+        /* NQ = */ NQ,
+        /* NK = */ NK,
+        /* NQ_aligned = */ L / BQ,
+        /* NK_aligned = */ N / BK,
+        /* qL_rem = */ L - (L / BQ) * BQ,
+        /* kL_rem = */ N - (N / BK) * BK,
+        /* qL_off = */ N - L,
+        /* Q_strides = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* K_strides = */ {k.strides(0), k.strides(1), k.strides(2)},
+        /* V_strides = */ {0, 0, 0},  // unused — V loaded manually
+        /* O_strides = */ {o.strides(0), o.strides(1), o.strides(2)},
+    };
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(qv_data, 2);
+    compute_encoder.set_input_array(qv_scales, 3);
+    compute_encoder.set_input_array(qv_biases, 4);
+    compute_encoder.set_output_array(o, 5);
+    compute_encoder.set_bytes(attn_params, 6);
+    compute_encoder.set_bytes(qv_data_head_stride, 7);
+    compute_encoder.set_bytes(qv_group_head_stride, 8);
+    compute_encoder.set_bytes(group_size_, 9);
+
+    MTL::Size grid_dims(NQ, H, B);
+    MTL::Size group_dims(32, WM, WN);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
 }
