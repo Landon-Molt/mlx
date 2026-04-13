@@ -28,15 +28,21 @@ using namespace metal;
       v_bits)
 
 // 4-bit TurboQuant: key MSE bits = 3 (ProdCodec uses bits-1), value bits = 4
-#define instantiate_sdpa_vector_tq_heads(type)           \
-  instantiate_sdpa_vector_tq(type, 64, 3, 4)            \
-  instantiate_sdpa_vector_tq(type, 128, 3, 4)           \
-  instantiate_sdpa_vector_tq(type, 256, 3, 4)           \
-  instantiate_sdpa_vector_tq(type, 512, 3, 4)           \
-  instantiate_sdpa_vector_tq_2pass(type, 64, 3, 4)      \
-  instantiate_sdpa_vector_tq_2pass(type, 128, 3, 4)     \
-  instantiate_sdpa_vector_tq_2pass(type, 256, 3, 4)     \
-  instantiate_sdpa_vector_tq_2pass(type, 512, 3, 4)
+#define instantiate_sdpa_vector_tq_all(type, dim) \
+  instantiate_sdpa_vector_tq(type, dim, 1, 2)    \
+  instantiate_sdpa_vector_tq(type, dim, 2, 3)    \
+  instantiate_sdpa_vector_tq(type, dim, 2, 4)    \
+  instantiate_sdpa_vector_tq(type, dim, 3, 4)    \
+  instantiate_sdpa_vector_tq(type, dim, 3, 3)    \
+  instantiate_sdpa_vector_tq(type, dim, 4, 4)    \
+  instantiate_sdpa_vector_tq(type, dim, 5, 6)    \
+  instantiate_sdpa_vector_tq(type, dim, 7, 8)
+
+#define instantiate_sdpa_vector_tq_heads(type)  \
+  instantiate_sdpa_vector_tq_all(type, 64)      \
+  instantiate_sdpa_vector_tq_all(type, 128)     \
+  instantiate_sdpa_vector_tq_all(type, 256)     \
+  instantiate_sdpa_vector_tq_all(type, 512)
 
 instantiate_sdpa_vector_tq_heads(float16_t)
 // clang-format on
