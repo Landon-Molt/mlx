@@ -861,6 +861,54 @@ array scaled_dot_product_attention(
   return fallback(std::move(inputs))[0];
 }
 
+array scaled_dot_product_attention_qv(
+    const array& queries,
+    const array& keys,
+    const array& qv_data,
+    const array& qv_scales,
+    const array& qv_biases,
+    const float scale,
+    int group_size,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] queries and keys expected rank 4");
+  }
+  if (qv_data.ndim() != 4 || qv_scales.ndim() != 4 || qv_biases.ndim() != 4) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] qv_data/scales/biases expected rank 4");
+  }
+  if (queries.shape(2) != 1) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv] only L=1 (decode) supported");
+  }
+
+  int D = queries.shape(-1);
+  auto final_type = queries.dtype();
+  auto q = astype(queries, final_type, s);
+  auto k = astype(keys, final_type, s);
+
+  auto fallback = [scale, group_size, s](const std::vector<array>& inputs) {
+    // Dequantize V, then standard attention
+    int bits = group_size == 64 ? 8 : 4;
+    auto v_deq = dequantize(
+        inputs[2], inputs[3], inputs[4],
+        std::optional<int>(group_size), std::optional<int>(bits));
+    auto q_scaled = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    auto scores = matmul(q_scaled, swapaxes(inputs[1], -1, -2, s), s);
+    auto weights = softmax(scores, std::vector<int>{-1}, true, s);
+    return std::vector<array>{matmul(weights, v_deq, s)};
+  };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {q, k, qv_data, qv_scales, qv_biases};
+
+  Shape out_shape{q.shape(0), q.shape(1), q.shape(2), D};
+  auto primitive = std::make_shared<ScaledDotProductAttentionQV>(
+      stream, fallback, scale, group_size);
+  return array(std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
 array scaled_dot_product_attention_tq(
     const array& q_rot,
     const array& q_proj,

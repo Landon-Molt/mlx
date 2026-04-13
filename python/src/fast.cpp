@@ -297,6 +297,49 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_qv",
+      [](const mx::array& queries,
+         const mx::array& keys,
+         const mx::array& qv_data,
+         const mx::array& qv_scales,
+         const mx::array& qv_biases,
+         float scale,
+         int group_size,
+         mx::StreamOrDevice s) {
+        return mx::fast::scaled_dot_product_attention_qv(
+            queries, keys, qv_data, qv_scales, qv_biases,
+            scale, group_size, s);
+      },
+      "q"_a,
+      "k"_a,
+      "qv_data"_a,
+      "qv_scales"_a,
+      "qv_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a = 32,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_qv(q: array, k: array, qv_data: array, qv_scales: array, qv_biases: array, *, scale: float, group_size: int = 32, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused SDPA with quantized values. K stays fp16 for scoring,
+        V is dequantized inline from mx.quantize 4-bit/8-bit format.
+        Asymmetric K/V: full-precision keys, compressed values.
+
+        Args:
+            q: Queries ``(B, n_q_heads, L, D)`` — L must be 1 (decode)
+            k: Keys ``(B, n_kv_heads, T, D)`` fp16
+            qv_data: Packed V ``(B, n_kv_heads, T, D/8)`` uint32
+            qv_scales: V scales ``(B, n_kv_heads, T, D/group_size)`` float32
+            qv_biases: V biases ``(B, n_kv_heads, T, D/group_size)`` float32
+            scale: Attention scale factor
+            group_size: Quantization group size (32 for 4-bit, 64 for 8-bit)
+
+        Returns:
+            Attention output ``(B, n_q_heads, L, D)``
+      )pbdoc");
+
+  m.def(
       "scaled_dot_product_attention_tq",
       [](const mx::array& q_rot,
          const mx::array& q_proj,

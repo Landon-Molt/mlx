@@ -42,3 +42,24 @@ instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
     // clang-format on
+
+// Quantized-V SDPA vector instantiations (K=fp16, V=4bit/8bit scalar)
+#include "mlx/backend/metal/kernels/sdpa_vector_qv.h"
+
+#define instantiate_sdpa_vector_qv(type, dim) \
+  instantiate_kernel("sdpa_vector_qv_" #type "_" #dim, sdpa_vector_qv, type, dim)
+#define instantiate_sdpa_vector_qv8(type, dim) \
+  instantiate_kernel("sdpa_vector_qv8_" #type "_" #dim, sdpa_vector_qv8, type, dim)
+
+#define instantiate_sdpa_vector_qv_heads(type) \
+  instantiate_sdpa_vector_qv(type, 64)  \
+  instantiate_sdpa_vector_qv(type, 96)  \
+  instantiate_sdpa_vector_qv(type, 128) \
+  instantiate_sdpa_vector_qv(type, 256) \
+  instantiate_sdpa_vector_qv8(type, 64)  \
+  instantiate_sdpa_vector_qv8(type, 96)  \
+  instantiate_sdpa_vector_qv8(type, 128) \
+  instantiate_sdpa_vector_qv8(type, 256)
+
+instantiate_sdpa_vector_qv_heads(float16_t)
+instantiate_sdpa_vector_qv_heads(bfloat16_t)

@@ -54,6 +54,16 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+MLX_API array scaled_dot_product_attention_qv(
+    const array& queries,
+    const array& keys,
+    const array& qv_data,
+    const array& qv_scales,
+    const array& qv_biases,
+    const float scale,
+    int group_size = 32,
+    StreamOrDevice s = {});
+
 MLX_API array scaled_dot_product_attention_tq(
     const array& q_rot,
     const array& q_proj,
