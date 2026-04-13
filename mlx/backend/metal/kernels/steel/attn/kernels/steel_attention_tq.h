@@ -153,20 +153,20 @@ template <
   constexpr short tgp_mem_1 = BK * (BD + padV);
   constexpr short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
 
+  // Single Q buffer — Q_rot and Q_proj loaded sequentially to halve
+  // threadgroup memory. This allows D up to 512 within 32KB limit.
   threadgroup T Q_smem[BQ * (BD + padQ)];
-  threadgroup T Qp_smem[BQ * (BD + padQ)];  // Q_proj for QJL scoring
   threadgroup T KV_smem[tgp_mem_s];
 
   threadgroup T* Qs = Q_smem;
-  threadgroup T* Qps = Qp_smem;
   threadgroup T* Ks = KV_smem;
   threadgroup T* Vs = KV_smem;
 
-  // Q loaders (Q_rot and Q_proj)
+  // Q loader — reused for both Q_rot and Q_proj
   using QBlockLoader = BlockLoaderT<T, BQ, BD, LDQ_tgp, 1, 1, WM * WN * 32>;
 
   QBlockLoader loader_q(Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
-  QBlockLoader loader_qp(Q_proj, params->Q_strides[2], Qps, simd_group_id, simd_lane_id);
+  QBlockLoader loader_qp(Q_proj, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
 
   const AccumType scale = params->scale * M_LOG2E_F;
 
@@ -201,13 +201,11 @@ template <
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Load Q_rot and Q_proj (standard fp16 load)
+  // Load Q_rot into shared memory (Q_proj loaded later per KV block)
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
     loader_q.load_safe(short2(BD, params->qL_rem));
-    loader_qp.load_safe(short2(BD, params->qL_rem));
   } else {
     loader_q.load_unsafe();
-    loader_qp.load_unsafe();
   }
 
   // Softmax accumulators
@@ -267,7 +265,9 @@ template <
       tile_matmad(Stile, Qtile, Ktile, Stile);
     }
 
-    // === Load K_sign tile: QJL sign bits → ±1 * scale * res_norm ===
+    // === QJL correction: reload Q_proj into Q_smem, load K_sign, second matmul ===
+
+    // Step 1: Load K_sign tile (reuse KV_smem)
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
       const int kv_seq_start = kb * BK;
@@ -293,24 +293,35 @@ template <
           uint sb = (sp[d >> 5] >> (d & 31)) & 1u;
           val = T(sb ? ksr : -ksr);
         }
-        // Transposed: Ks[d][t]
         Ks[d * LDK_tgp + t_local] = val;
       }
     }
 
-    // S_qjl = Q_proj @ K_sign^T  (add to S_mse)
+    // Step 2: Load Q_proj into Q_smem (overwriting Q_rot — will reload later)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+      loader_qp.load_safe(short2(BD, params->qL_rem));
+    } else {
+      loader_qp.load_unsafe();
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Use Q_proj tile offset (same layout as Q_rot)
-    const short Qps_offset = (tm + sm) * LDQ_tgp + sn;
-
+    // Step 3: S_qjl = Q_proj @ K_sign^T  (add to S_mse already in Stile)
     STEEL_PRAGMA_UNROLL
     for (short dd = 0; dd < TD_tiles; dd++) {
       simdgroup_barrier(mem_flags::mem_none);
-      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(&Qps[Qps_offset + dd * Qs_tile_stride]);
+      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(&Qs[Qs_offset + dd * Qs_tile_stride]);
       Ktile.template load<T, 1, 1, LDK_tgp, 1>(&Ks[Ks_offset + dd * Ks_tile_stride]);
       simdgroup_barrier(mem_flags::mem_none);
       tile_matmad(Stile, Qtile, Ktile, Stile);
+    }
+
+    // Step 4: Reload Q_rot for next iteration's MSE scoring
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+      loader_q.load_safe(short2(BD, params->qL_rem));
+    } else {
+      loader_q.load_unsafe();
     }
 
     // Apply scale (log2e for fast::exp2 in softmax)

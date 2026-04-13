@@ -864,7 +864,9 @@ void ScaledDotProductAttentionTQ::eval_gpu(
   compute_encoder.set_bytes(k_head_stride, 14);
   compute_encoder.set_bytes(v_head_stride, 15);
 
-  if (L <= 8) {
+  if (L <= 8 || D > 256) {
+    // D>256: steel kernel exceeds 32KB threadgroup memory
+    // gemma-4-31B D=512 is only 10/60 full-attn layers — decode fallback acceptable
     // Decode / short-seq: use sdpa_vector_tq (one threadgroup per query)
     MTL::Size group_dims(1024, 1, 1);
     MTL::Size grid_dims(n_q_heads_total, L, 1);
@@ -873,9 +875,9 @@ void ScaledDotProductAttentionTQ::eval_gpu(
     // Prefill: use steel attention_tq (tiled flash attention)
     int n_kv_heads = key_norms.shape(0);
     int batch_size = n_q_heads_total / (n_kv_heads * gqa_factor_);
-    int BQ = 32;
-    int BK = 32;
-    int WM = 4;
+    int BQ = D >= 512 ? 16 : 32;
+    int BK = D <= 128 ? 32 : 16;
+    int WM = D >= 512 ? 2 : 4;
     int WN = 1;
 
     std::string steel_kname;

@@ -15,9 +15,13 @@ using namespace metal;
       attention_tq,                                                         \
       type, bq, bk, bd, wm, wn, k_bits, v_bits, float)
 
-// 4-bit TQ (MSE key bits = 3, value bits = 4) — the common case
+// 4-bit TQ (MSE key bits = 3, value bits = 4) for common head dims
+// BK=16 for BD>=128 to reduce threadgroup memory pressure
 #define instantiate_attention_tq_heads(type)                    \
-  instantiate_attention_tq(type, 32, 32, 128, 4, 1, 3, 4)
+  instantiate_attention_tq(type, 32, 32, 64, 4, 1, 3, 4)      \
+  instantiate_attention_tq(type, 32, 32, 128, 4, 1, 3, 4)     \
+  instantiate_attention_tq(type, 32, 16, 256, 4, 1, 3, 4)     \
+  instantiate_attention_tq(type, 16, 16, 512, 2, 1, 3, 4)
 
 instantiate_attention_tq_heads(float16_t)
 // clang-format on
