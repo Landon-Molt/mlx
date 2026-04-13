@@ -864,10 +864,108 @@ void ScaledDotProductAttentionTQ::eval_gpu(
   compute_encoder.set_bytes(k_head_stride, 14);
   compute_encoder.set_bytes(v_head_stride, 15);
 
-  // Single dispatch — one threadgroup per (q_batch_head, q_seq_idx)
-  MTL::Size group_dims(1024, 1, 1);  // BN*BD = 32*32
-  MTL::Size grid_dims(n_q_heads_total, L, 1);
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  if (L <= 8) {
+    // Decode / short-seq: use sdpa_vector_tq (one threadgroup per query)
+    MTL::Size group_dims(1024, 1, 1);
+    MTL::Size grid_dims(n_q_heads_total, L, 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  } else {
+    // Prefill: use steel attention_tq (tiled flash attention)
+    int n_kv_heads = key_norms.shape(0);
+    int batch_size = n_q_heads_total / (n_kv_heads * gqa_factor_);
+    int BQ = 32;
+    int BK = 32;
+    int WM = 4;
+    int WN = 1;
+
+    std::string steel_kname;
+    steel_kname.reserve(128);
+    steel_kname += "attention_tq_";
+    steel_kname += get_type_string(q_rot.dtype());
+    steel_kname += "_bq";
+    steel_kname += std::to_string(BQ);
+    steel_kname += "_bk";
+    steel_kname += std::to_string(BK);
+    steel_kname += "_bd";
+    steel_kname += std::to_string(D);
+    steel_kname += "_wm";
+    steel_kname += std::to_string(WM);
+    steel_kname += "_wn";
+    steel_kname += std::to_string(WN);
+    steel_kname += "_k";
+    steel_kname += std::to_string(key_bits_);
+    steel_kname += "_v";
+    steel_kname += std::to_string(val_bits_);
+
+    bool align_Q = (L % BQ) == 0;
+    bool align_K = (N % BK) == 0;
+    metal::MTLFCList steel_fc = {
+        {&align_Q, MTL::DataType::DataTypeBool, 200},
+        {&align_K, MTL::DataType::DataTypeBool, 201},
+        {&has_mask, MTL::DataType::DataTypeBool, 300},
+        {&do_causal, MTL::DataType::DataTypeBool, 301},
+    };
+
+    std::string steel_hash = steel_kname;
+    steel_hash += align_Q ? "_aQ" : "_nQ";
+    steel_hash += align_K ? "_aK" : "_nK";
+    steel_hash += do_causal ? "_c" : "_nc";
+
+    auto steel_kernel = d.get_kernel(steel_kname, steel_hash, steel_fc);
+    compute_encoder.set_compute_pipeline_state(steel_kernel);
+
+    int NQ = (L + BQ - 1) / BQ;
+    int NK = (N + BK - 1) / BK;
+
+    using namespace mlx::steel;
+    AttnParams attn_params{
+        /* B = */ batch_size,
+        /* H = */ n_q_heads_total / batch_size,
+        /* D = */ D,
+        /* qL = */ L,
+        /* kL = */ N,
+        /* gqa_factor = */ gqa_factor_,
+        /* scale = */ scale_,
+        /* NQ = */ NQ,
+        /* NK = */ NK,
+        /* NQ_aligned = */ L / BQ,
+        /* NK_aligned = */ N / BK,
+        /* qL_rem = */ L - (L / BQ) * BQ,
+        /* kL_rem = */ N - (N / BK) * BK,
+        /* qL_off = */ N - L,
+        /* Q_strides = */ {q_rot.strides(0), 0, D},
+        /* K_strides = */ {static_cast<int64_t>(k_head_stride), 0, 0},
+        /* V_strides = */ {static_cast<int64_t>(v_head_stride), 0, 0},
+        /* O_strides = */ {o.strides(0), 0, D},
+    };
+
+    // TQ-specific params
+    struct TQParams {
+      int k_bits;
+      int v_bits;
+      int k_packed_width;
+      int v_packed_width;
+    };
+    int k_packed_w = (D * key_bits_ + 31) / 32;
+    int v_packed_w = (D * val_bits_ + 31) / 32;
+    TQParams tq_params{key_bits_, val_bits_, k_packed_w, v_packed_w};
+
+    // Set buffers matching steel_attention_tq.h
+    compute_encoder.set_input_array(q_rot, 0);     // Q (pre-rotated)
+    compute_encoder.set_input_array(key_norms, 1);
+    compute_encoder.set_input_array(key_mse_indices, 2);
+    compute_encoder.set_input_array(val_norms, 3);
+    compute_encoder.set_input_array(val_indices, 4);
+    compute_encoder.set_input_array(key_codebook, 5);
+    compute_encoder.set_input_array(val_codebook, 6);
+    compute_encoder.set_output_array(o, 7);
+    compute_encoder.set_bytes(attn_params, 8);
+    compute_encoder.set_bytes(tq_params, 9);
+
+    MTL::Size steel_grid(NQ, n_q_heads_total / batch_size, batch_size);
+    MTL::Size steel_group(32, WM, WN);
+    compute_encoder.dispatch_threadgroups(steel_grid, steel_group);
+  }
 }
 
 bool ScaledDotProductAttentionTQ::is_equivalent(const Primitive& other) const {
