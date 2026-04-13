@@ -917,10 +917,28 @@ void ScaledDotProductAttentionTQ::eval_gpu(
     int NQ = (L + BQ - 1) / BQ;
     int NK = (N + BK - 1) / BK;
 
+    // q_rot shape: (n_q_heads_total, L, D) = (B*H_q, L, D)
+    // key_norms shape: (n_kv_heads_total, T) = (B*H_kv, T)
+    // o shape: (n_q_heads_total, L, D) = (B*H_q, L, D)
+    int H_q = n_q_heads_total / batch_size;
+    int H_kv = n_kv_heads;
+
+    // 4D strides for steel: (B, H, L, D=1)
+    int64_t q_batch_stride = H_q * L * D;          // skip all heads in batch
+    int64_t q_head_stride = L * D;                  // skip one head
+    int64_t q_seq_stride = D;                       // skip one token
+
+    int64_t kv_batch_stride = H_kv * N;             // norms: (B*H_kv, T)
+    int64_t kv_head_stride_4d = N;                  // one head of norms
+
+    int64_t o_batch_stride = H_q * L * D;
+    int64_t o_head_stride = L * D;
+    int64_t o_seq_stride = D;
+
     using namespace mlx::steel;
     AttnParams attn_params{
         /* B = */ batch_size,
-        /* H = */ n_q_heads_total / batch_size,
+        /* H = */ H_q,
         /* D = */ D,
         /* qL = */ L,
         /* kL = */ N,
@@ -933,10 +951,10 @@ void ScaledDotProductAttentionTQ::eval_gpu(
         /* qL_rem = */ L - (L / BQ) * BQ,
         /* kL_rem = */ N - (N / BK) * BK,
         /* qL_off = */ N - L,
-        /* Q_strides = */ {q_rot.strides(0), 0, D},
-        /* K_strides = */ {static_cast<int64_t>(k_head_stride), 0, 0},
-        /* V_strides = */ {static_cast<int64_t>(v_head_stride), 0, 0},
-        /* O_strides = */ {o.strides(0), 0, D},
+        /* Q_strides = */ {q_batch_stride, q_head_stride, q_seq_stride},
+        /* K_strides = */ {kv_batch_stride, kv_head_stride_4d, 0},
+        /* V_strides = */ {kv_batch_stride, kv_head_stride_4d, 0},
+        /* O_strides = */ {o_batch_stride, o_head_stride, o_seq_stride},
     };
 
     // TQ-specific params
@@ -951,16 +969,20 @@ void ScaledDotProductAttentionTQ::eval_gpu(
     TQParams tq_params{key_bits_, val_bits_, k_packed_w, v_packed_w};
 
     // Set buffers matching steel_attention_tq.h
-    compute_encoder.set_input_array(q_rot, 0);     // Q (pre-rotated)
-    compute_encoder.set_input_array(key_norms, 1);
-    compute_encoder.set_input_array(key_mse_indices, 2);
-    compute_encoder.set_input_array(val_norms, 3);
-    compute_encoder.set_input_array(val_indices, 4);
-    compute_encoder.set_input_array(key_codebook, 5);
-    compute_encoder.set_input_array(val_codebook, 6);
-    compute_encoder.set_output_array(o, 7);
-    compute_encoder.set_bytes(attn_params, 8);
-    compute_encoder.set_bytes(tq_params, 9);
+    compute_encoder.set_input_array(q_rot, 0);      // Q_rot
+    compute_encoder.set_input_array(q_proj, 1);      // Q_proj (for QJL)
+    compute_encoder.set_input_array(key_norms, 2);
+    compute_encoder.set_input_array(key_mse_indices, 3);
+    compute_encoder.set_input_array(key_res_norms, 4);  // QJL res norms
+    compute_encoder.set_input_array(key_signs, 5);       // QJL signs
+    compute_encoder.set_input_array(val_norms, 6);
+    compute_encoder.set_input_array(val_indices, 7);
+    compute_encoder.set_input_array(key_codebook, 8);
+    compute_encoder.set_input_array(key_scale, 9);       // QJL scale
+    compute_encoder.set_input_array(val_codebook, 10);
+    compute_encoder.set_output_array(o, 11);
+    compute_encoder.set_bytes(attn_params, 12);
+    compute_encoder.set_bytes(tq_params, 13);
 
     MTL::Size steel_grid(NQ, n_q_heads_total / batch_size, batch_size);
     MTL::Size steel_group(32, WM, WN);

@@ -89,22 +89,26 @@ template <
     int V_BITS,
     typename AccumType = float>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention_tq(
-    // Queries (pre-rotated, fp16)
+    // Queries (pre-rotated + projected, fp16)
     const device T* Q [[buffer(0)]],
-    // Key TQ state
-    const device half* key_norms [[buffer(1)]],
-    const device uint32_t* key_indices [[buffer(2)]],
-    // Value TQ state
-    const device half* val_norms [[buffer(3)]],
-    const device uint32_t* val_indices [[buffer(4)]],
-    // Codebooks
-    const device float* key_codebook [[buffer(5)]],
-    const device float* val_codebook [[buffer(6)]],
+    const device T* Q_proj [[buffer(1)]],
+    // Key TQ state (ProdCodec: MSE + QJL)
+    const device half* key_norms [[buffer(2)]],
+    const device uint32_t* key_indices [[buffer(3)]],
+    const device half* key_res_norms [[buffer(4)]],
+    const device uint32_t* key_signs [[buffer(5)]],
+    // Value TQ state (MSECodec)
+    const device half* val_norms [[buffer(6)]],
+    const device uint32_t* val_indices [[buffer(7)]],
+    // Codebooks + scale
+    const device float* key_codebook [[buffer(8)]],
+    const device float* key_scale [[buffer(9)]],
+    const device float* val_codebook [[buffer(10)]],
     // Output
-    device T* O [[buffer(7)]],
+    device T* O [[buffer(11)]],
     // Params
-    const constant AttnParams* params [[buffer(8)]],
-    const constant TQParams* tq_params [[buffer(9)]],
+    const constant AttnParams* params [[buffer(12)]],
+    const constant TQParams* tq_params [[buffer(13)]],
     // Thread indices
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -115,6 +119,8 @@ template <
 
   const int kv_packed_stride_k = tq_params->k_packed_width;
   const int kv_packed_stride_v = tq_params->v_packed_width;
+  const int kv_sign_stride = (BD + 31) / 32;
+  const float kscale = key_scale[0];
 
   // Move to correct block
   ulong3 tidl{tid.x, tid.y, tid.z};
@@ -123,15 +129,18 @@ template <
       tidl.y * params->Q_strides[1] +
       tidl.x * BQ * params->Q_strides[2];
 
+  Q_proj += tidl.z * params->Q_strides[0] +
+      tidl.y * params->Q_strides[1] +
+      tidl.x * BQ * params->Q_strides[2];
+
   ulong kv_head_idx = int(tid.y) / params->gqa_factor;
-  // KV state: (B, n_kv_heads, T, packed_width) — contiguous
   ulong kv_offset = tidl.z * params->K_strides[0] + kv_head_idx * params->K_strides[1];
 
   O += tidl.z * params->O_strides[0] +
       tidl.y * params->O_strides[1] +
       tidl.x * BQ * params->O_strides[2];
 
-  // Threadgroup memory
+  // Threadgroup memory — need space for Q, Q_proj, K, K_sign, V
   constexpr short padQ = 16 / sizeof(T);
   constexpr short padK = 16 / sizeof(T);
   constexpr short padV = 16 / sizeof(T);
@@ -145,16 +154,19 @@ template <
   constexpr short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
 
   threadgroup T Q_smem[BQ * (BD + padQ)];
+  threadgroup T Qp_smem[BQ * (BD + padQ)];  // Q_proj for QJL scoring
   threadgroup T KV_smem[tgp_mem_s];
 
   threadgroup T* Qs = Q_smem;
+  threadgroup T* Qps = Qp_smem;
   threadgroup T* Ks = KV_smem;
   threadgroup T* Vs = KV_smem;
 
-  // Q loader (standard — reads fp16 queries)
+  // Q loaders (Q_rot and Q_proj)
   using QBlockLoader = BlockLoaderT<T, BQ, BD, LDQ_tgp, 1, 1, WM * WN * 32>;
 
   QBlockLoader loader_q(Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
+  QBlockLoader loader_qp(Q_proj, params->Q_strides[2], Qps, simd_group_id, simd_lane_id);
 
   const AccumType scale = params->scale * M_LOG2E_F;
 
@@ -189,11 +201,13 @@ template <
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Load Q (standard fp16 load)
+  // Load Q_rot and Q_proj (standard fp16 load)
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
     loader_q.load_safe(short2(BD, params->qL_rem));
+    loader_qp.load_safe(short2(BD, params->qL_rem));
   } else {
     loader_q.load_unsafe();
+    loader_qp.load_unsafe();
   }
 
   // Softmax accumulators
@@ -213,15 +227,11 @@ template <
   for (int kb = 0; kb < params->NK; kb++) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // === Load K tile: dequant TQ → fp16 in shared memory (transposed) ===
-    // K is stored transposed: Ks[d, t] for matmul Q @ K^T
+    // === Load K_MSE tile: dequant codebook → fp16 transposed ===
     {
       const int kv_seq_start = kb * BK;
       const int kv_seq_end = min(kv_seq_start + BK, params->kL);
       const int valid_tokens = kv_seq_end - kv_seq_start;
-
-      // Each thread dequants multiple elements: total = BK * BD
-      // Thread i handles elements [i * elems_per_thread, (i+1) * elems_per_thread)
       const int total_elems = BK * BD;
       const int elems_per_thread = (total_elems + total_threads - 1) / total_threads;
 
@@ -229,8 +239,8 @@ template <
         int flat_idx = thread_idx * elems_per_thread + e;
         if (flat_idx >= total_elems) break;
 
-        int t_local = flat_idx / BD;  // token within tile [0, BK)
-        int d = flat_idx % BD;        // dimension [0, BD)
+        int t_local = flat_idx / BD;
+        int d = flat_idx % BD;
         int t_global = kv_seq_start + t_local;
 
         T val = T(0);
@@ -239,12 +249,12 @@ template <
           const device uint32_t* kp = key_indices + (kv_offset + t_global) * kv_packed_stride_k;
           val = T(tq_dequant_elem<K_BITS>(kp, d, key_codebook, kn));
         }
-        // Store transposed: Ks[d][t] for K^T
+        // Transposed: Ks[d][t]
         Ks[d * LDK_tgp + t_local] = val;
       }
     }
 
-    // S = Q @ K^T
+    // S_mse = Q_rot @ K_mse^T
     Stile.clear();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -257,7 +267,53 @@ template <
       tile_matmad(Stile, Qtile, Ktile, Stile);
     }
 
-    // Apply scale
+    // === Load K_sign tile: QJL sign bits → ±1 * scale * res_norm ===
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const int kv_seq_start = kb * BK;
+      const int kv_seq_end = min(kv_seq_start + BK, params->kL);
+      const int valid_tokens = kv_seq_end - kv_seq_start;
+      const int total_elems = BK * BD;
+      const int elems_per_thread = (total_elems + total_threads - 1) / total_threads;
+
+      for (int e = 0; e < elems_per_thread; e++) {
+        int flat_idx = thread_idx * elems_per_thread + e;
+        if (flat_idx >= total_elems) break;
+
+        int t_local = flat_idx / BD;
+        int d = flat_idx % BD;
+        int t_global = kv_seq_start + t_local;
+
+        T val = T(0);
+        if (t_local < valid_tokens && t_global < params->kL) {
+          float kn = float(key_norms[kv_offset + t_global]);
+          float krn = float(key_res_norms[kv_offset + t_global]);
+          float ksr = kn * kscale * krn;
+          const device uint32_t* sp = key_signs + (kv_offset + t_global) * kv_sign_stride;
+          uint sb = (sp[d >> 5] >> (d & 31)) & 1u;
+          val = T(sb ? ksr : -ksr);
+        }
+        // Transposed: Ks[d][t]
+        Ks[d * LDK_tgp + t_local] = val;
+      }
+    }
+
+    // S_qjl = Q_proj @ K_sign^T  (add to S_mse)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Use Q_proj tile offset (same layout as Q_rot)
+    const short Qps_offset = (tm + sm) * LDQ_tgp + sn;
+
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TD_tiles; dd++) {
+      simdgroup_barrier(mem_flags::mem_none);
+      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(&Qps[Qps_offset + dd * Qs_tile_stride]);
+      Ktile.template load<T, 1, 1, LDK_tgp, 1>(&Ks[Ks_offset + dd * Ks_tile_stride]);
+      simdgroup_barrier(mem_flags::mem_none);
+      tile_matmad(Stile, Qtile, Ktile, Stile);
+    }
+
+    // Apply scale (log2e for fast::exp2 in softmax)
     STEEL_PRAGMA_UNROLL
     for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
       Stile.elems()[ii] *= scale;
